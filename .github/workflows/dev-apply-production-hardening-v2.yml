@@ -18,6 +18,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Repair v2 UI patch helper
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path('scripts/apply_production_hardening_v2.py')
+          t=p.read_text(encoding='utf-8')
+          old='''class LoginDialog\'\'\'\n    text = replace_between(text, "class LoginDialog", "class Page", password_dialog, "masked mandatory password dialog")'''
+          new='''\'\'\'\n    text = replace_once(text, "class LoginDialog(tk.Toplevel):", password_dialog + "\\n\\nclass LoginDialog(tk.Toplevel):", "masked mandatory password dialog")'''
+          if old not in t:
+              raise SystemExit('v2 UI patch repair anchor not found')
+          p.write_text(t.replace(old,new,1),encoding='utf-8')
+          print('repaired v2 UI patch helper')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Apply production hardening v2
         shell: pwsh
         run: |
@@ -33,7 +48,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add jewel_server/db.py jewel_server/services.py jewel_server/security.py jewel_server/integrity.py jewel_server/main.py jewel_client/main.py
+          git add jewel_server/db.py jewel_server/services.py jewel_server/security.py jewel_server/integrity.py jewel_server/main.py jewel_client/main.py scripts/apply_production_hardening_v2.py
           git diff --cached --quiet && exit 0
           git commit -m "Apply production hardening v2 exact storage and day-close"
           git push origin HEAD:production-hardening-v2
