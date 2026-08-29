@@ -141,6 +141,21 @@ def force_initial_password_change(root,api,user):
     return True
 
 
+def ensure_company_setup(root,api):
+    try:data=api.get('/api/company')
+    except Exception as e:
+        messagebox.showerror('Company setup',str(e),parent=root);return False
+    if data.get('configured'):return True
+    settings=data.get('settings',{});branch=data.get('branch') or {}
+    defaults={**settings,'branch_name':branch.get('name','Main Showroom'),'counter_count':str(data.get('counter_count') or 1)}
+    fields=[('business_name','Company name'),('branch_name','Main branch / showroom name'),('business_state_code','GST state code (2 digits)'),('business_state_name','State name'),('business_gstin','GSTIN (optional)'),('business_address','Address'),('business_pincode','PIN code'),('business_phone','Phone'),('business_email','Email'),('counter_count','Number of counters'),('invoice_prefix','Invoice prefix'),('tag_prefix','Tag prefix'),('gst_default','Default GST %'),('business_timezone_offset_minutes','Timezone offset minutes')]
+    while True:
+        values=form_dialog(root,'Company setup',fields,defaults)
+        if not values:return False
+        try:
+            values['counter_count']=int(values.get('counter_count') or 1);api.put('/api/company',values);messagebox.showinfo('Company setup','Company settings saved. JewelLAN is ready for shop configuration.',parent=root);return True
+        except Exception as e:
+            messagebox.showerror('Company setup',str(e),parent=root);defaults.update(values)
 
 
 class LoginDialog(tk.Toplevel):
@@ -241,7 +256,7 @@ class App(ttk.Frame):
         body = tk.Frame(self, bg=PALETTE["bg"]); body.pack(fill="both", expand=True)
         nav = ttk.Frame(body, style="Nav.TFrame", width=220); nav.pack(side="left", fill="y"); nav.pack_propagate(False)
         ttk.Label(nav, text="JewelLAN", style="NavBrand.TLabel").pack(anchor="w", padx=18, pady=(22, 2))
-        ttk.Label(nav, text=self.settings.get("business_name", "Jewellery Store"), style="NavMuted.TLabel", wraplength=180).pack(anchor="w", padx=18, pady=(0, 18))
+        self.company_label=ttk.Label(nav, text=self.settings.get("business_name") or "Company not configured", style="NavMuted.TLabel", wraplength=180);self.company_label.pack(anchor="w", padx=18, pady=(0, 18))
 
         role = self.user.get("role", "cashier")
         pages = [("Overview", DashboardPage), ("Inventory", InventoryPage), ("Parties", PartiesPage)]
@@ -704,11 +719,17 @@ class AdminPage(Page):
             try:self.api.post("/api/users",d);self.refresh_users()
             except Exception as e:self.app.error(e)
     def make_business(self):
-        f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Business");keys=("business_name","business_address","business_phone","business_gstin","business_timezone_offset_minutes","invoice_prefix","tag_prefix","gst_default","label_width_mm","label_height_mm","backup_interval_hours","backup_retention_days");self.bv={}
-        for i,k in enumerate(keys):self.bv[k]=tk.StringVar(value=self.app.settings.get(k,""));ttk.Label(f,text=k.replace("_"," ").title()).grid(row=i,column=0,sticky="w",pady=3);ttk.Entry(f,textvariable=self.bv[k]).grid(row=i,column=1,sticky="ew",padx=8)
-        f.columnconfigure(1,weight=1);ttk.Button(f,text="Save",command=self.save_business).grid(row=len(keys)+1,column=0,columnspan=2,sticky="ew",pady=10)
+        f=ttk.Frame(self.nb,padding=12);self.nb.add(f,text="Company settings");self.bv={}
+        try:d=self.api.get('/api/company')
+        except Exception as e:d={'settings':self.app.settings,'branch':{},'counter_count':len(self.app.counters)};self.app.error(e)
+        s=d.get('settings',{});branch=d.get('branch') or {}
+        fields=[('business_name','Company name',s.get('business_name','')),('branch_name','Main branch / showroom',branch.get('name','Main Showroom')),('business_state_code','GST state code',s.get('business_state_code','')),('business_state_name','State name',s.get('business_state_name','')),('business_gstin','GSTIN',s.get('business_gstin','')),('business_address','Address',s.get('business_address','')),('business_pincode','PIN code',s.get('business_pincode','')),('business_phone','Phone',s.get('business_phone','')),('business_email','Email',s.get('business_email','')),('counter_count','Number of counters',str(d.get('counter_count') or 1)),('invoice_prefix','Invoice prefix',s.get('invoice_prefix','INV')),('tag_prefix','Tag prefix',s.get('tag_prefix','TAG')),('gst_default','Default GST %',s.get('gst_default','3')),('business_timezone_offset_minutes','Timezone offset minutes',s.get('business_timezone_offset_minutes','330'))]
+        ttk.Label(f,text='These values belong to the company database and appear on invoices/reports. They are not hard-coded into JewelLAN.',style='SurfaceMuted.TLabel',wraplength=900).grid(row=0,column=0,columnspan=2,sticky='w',pady=(0,10))
+        for i,(k,label,value) in enumerate(fields,1):self.bv[k]=tk.StringVar(value=str(value));ttk.Label(f,text=label).grid(row=i,column=0,sticky='w',pady=3);ttk.Entry(f,textvariable=self.bv[k]).grid(row=i,column=1,sticky='ew',padx=8)
+        f.columnconfigure(1,weight=1);ttk.Button(f,text="Save company settings",style='Primary.TButton',command=self.save_business).grid(row=len(fields)+2,column=0,columnspan=2,sticky="ew",pady=12)
     def save_business(self):
-        try:self.api.put("/api/settings",{k:v.get() for k,v in self.bv.items()});self.app.load_settings();messagebox.showinfo("Settings","Saved",parent=self)
+        try:
+            p={k:v.get() for k,v in self.bv.items()};p['counter_count']=int(p.get('counter_count') or 1);r=self.api.put('/api/company',p);self.app.load_settings();self.app.company_label.configure(text=self.app.settings.get('business_name') or 'Company not configured');messagebox.showinfo('Company settings','Saved',parent=self)
         except Exception as e:self.app.error(e)
 
 
@@ -716,6 +737,7 @@ def main():
     root=tk.Tk();root.withdraw();cfg=load_config();api=Api(cfg.get("server_url",""),cfg.get("server_fingerprint",""));login=LoginDialog(root,api,cfg);root.wait_window(login)
     if not login.user:return
     if login.user.get("must_change_password") and not force_initial_password_change(root,api,login.user):return
+    if not ensure_company_setup(root,api):return
     root.deiconify();App(root,api,cfg,login.user);root.mainloop()
 
 

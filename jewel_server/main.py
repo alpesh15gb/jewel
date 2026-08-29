@@ -6,6 +6,7 @@ import uvicorn
 from fastapi import Body,Depends,FastAPI,HTTPException,Query,Request
 from fastapi.responses import Response
 from .backup import BackupWorker,backup_status,create_backup,list_backups,restore_backup,verify_backup
+from .company import get_company,save_company
 from .db import audit,business_date,business_now,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
 from .discovery import DiscoveryResponder
 from .pdfs import credit_note_pdf,invoice_pdf,label_pdf,stock_report_pdf
@@ -18,7 +19,7 @@ from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,ge
 from .tls import tls_identity
 
 PRODUCTION_HARDENED_V1 = True
-APP_VERSION='1.2.0-rc1'
+APP_VERSION='1.2.0-rc3'
 backup_worker=None;discovery=None;tally_worker=None
 @asynccontextmanager
 async def lifespan(app):
@@ -83,12 +84,23 @@ def settings(u=Depends(current_user)):
     with read_db() as c:return {'settings':get_settings(c),'branches':rowsdict(c.execute('SELECT * FROM branches WHERE active=1 ORDER BY name').fetchall()),'counters':rowsdict(c.execute('SELECT * FROM counters WHERE active=1 ORDER BY branch_id,name').fetchall())}
 @app.put('/api/settings')
 def save_settings(p:dict=Body(...),u=Depends(require('*'))):
-    allowed={'business_name','business_address','business_phone','business_gstin','business_state_code','business_timezone_offset_minutes','currency','invoice_prefix','tag_prefix','gst_default','label_width_mm','label_height_mm','backup_interval_hours','backup_retention_days','tally_enabled','tally_bridge_url','tally_bridge_token','tally_company','tally_auto_create_parties'}
+    allowed={'business_name','business_address','business_phone','business_email','business_gstin','business_state_code','business_state_name','business_pincode','business_timezone_offset_minutes','currency','invoice_prefix','tag_prefix','gst_default','label_width_mm','label_height_mm','backup_interval_hours','backup_retention_days','tally_enabled','tally_bridge_url','tally_bridge_token','tally_company','tally_auto_create_parties'}
     with write_db() as c:
         for k,v in p.items():
             if k in allowed:set_setting(c,k,str(v))
         audit(c,u['id'],'update','settings',None,p)
     return {'ok':True}
+
+@app.get('/api/company')
+def company_settings(u=Depends(current_user)):
+    with read_db() as c:return get_company(c)
+
+@app.put('/api/company')
+def company_settings_save(p:dict=Body(...),u=Depends(require('*'))):
+    try:
+        with write_db() as c:return save_company(c,p,u['id'])
+    except ValueError as e:raise HTTPException(400,str(e))
+
 @app.get('/api/users')
 def users(u=Depends(require('*'))):
     with read_db() as c:return rowsdict(c.execute('SELECT id,username,full_name,role,active,must_change_password,created_at,updated_at FROM users ORDER BY username').fetchall())
