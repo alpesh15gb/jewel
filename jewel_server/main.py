@@ -11,6 +11,7 @@ from .discovery import DiscoveryResponder
 from .pdfs import invoice_pdf,label_pdf,stock_report_pdf
 from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
 from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
+from .returns import cancel_sale_return,list_returns,post_sale_return,return_detail
 from .integrity import database_integrity,day_close
 from .precision import money_paise,money_sum
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
@@ -225,6 +226,19 @@ def sale_cancel(sid:int,req:Request,p:dict=Body(default={}),u=Depends(require('s
     if u['role'] not in ('admin','manager'):raise HTTPException(403,'Manager permission required to cancel invoices')
     with write_db() as c:return cancel_sale(c,sid,u,str(p.get('reason') or 'Cancelled'),ip(req))
 
+@app.get('/api/returns')
+def returns_list(limit:int=Query(500,le=2000),u=Depends(require('returns'))):
+    with read_db() as c:return list_returns(c,limit)
+@app.get('/api/returns/{rid}')
+def returns_detail(rid:int,u=Depends(require('returns'))):
+    with read_db() as c:return return_detail(c,rid)
+@app.post('/api/sales/{sid}/return')
+def sales_return(sid:int,req:Request,p:dict=Body(...),u=Depends(require('returns'))):
+    with write_db() as c:return post_sale_return(c,sid,p,u,ip(req))
+@app.post('/api/returns/{rid}/cancel')
+def returns_cancel(rid:int,req:Request,p:dict=Body(default={}),u=Depends(require('returns'))):
+    with write_db() as c:return cancel_sale_return(c,rid,u,str(p.get('reason') or ''),ip(req))
+
 @app.post('/api/purchases')
 def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
     req=str(p.get('client_request_id') or '').strip() or None
@@ -240,7 +254,8 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
         for x in its:
             x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount,cost_amount_paise,gst_amount_paise) VALUES(?,?,?,0,?,0)',(pid,it['id'],it['cost_amount'],money_paise(it['cost_amount'])))
         payable=money(total-paid)
-        if sid and payable:c.execute('UPDATE suppliers SET balance=balance+?,updated_at=? WHERE id=?',(payable,now,sid))
+        if sid and payable:
+            row=c.execute('SELECT balance_paise FROM suppliers WHERE id=?',(sid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(payable);c.execute('UPDATE suppliers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(money(newp/100),newp,now,sid))
         je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,business_day,f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
         if gst:lines.append(('2110',gst,0,None,None))
         if paid:lines.append(('1000',0,paid,None,None))
@@ -284,7 +299,7 @@ def kledger_add(kid:int,p:dict=Body(...),u=Depends(require('contacts'))):
     typ=p.get('entry_type') or 'adjustment';wt=weight(p.get('weight'));amt=money(p.get('amount'))
     with write_db() as c:
         if not c.execute('SELECT id FROM karigars WHERE id=?',(kid,)).fetchone():raise HTTPException(404,'Karigar not found')
-        cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;c.execute('UPDATE karigars SET metal_balance_grams=metal_balance_grams+?,cash_balance=cash_balance+?,updated_at=? WHERE id=?',(md,cd,utcnow(),kid));return {'id':cur.lastrowid}
+        cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;row=c.execute('SELECT metal_balance_mg,cash_balance_paise FROM karigars WHERE id=?',(kid,)).fetchone();newmg=int(row['metal_balance_mg'] or 0)+int(round(md*1000));newp=int(row['cash_balance_paise'] or 0)+money_paise(cd);c.execute('UPDATE karigars SET metal_balance_grams=?,metal_balance_mg=?,cash_balance=?,cash_balance_paise=?,updated_at=? WHERE id=?',(newmg/1000.0,newmg,money(newp/100),newp,utcnow(),kid));return {'id':cur.lastrowid}
 
 @app.get('/api/approvals')
 def approvals(u=Depends(require('approvals'))):

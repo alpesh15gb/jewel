@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
 PRODUCTION_HARDENED_V1 = True
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def app_data_dir() -> Path:
@@ -373,7 +373,106 @@ def _migration_4(conn) -> None:
         conn.execute(statement)
 
 
-MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4))
+def _migration_5(conn) -> None:
+    _add_column_if_missing(conn, "customers", "balance_paise", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "suppliers", "balance_paise", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "karigars", "cash_balance_paise", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "karigars", "metal_balance_mg", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE customers SET balance_paise=CAST(ROUND(balance*100) AS INTEGER)")
+    conn.execute("UPDATE suppliers SET balance_paise=CAST(ROUND(balance*100) AS INTEGER)")
+    conn.execute("UPDATE karigars SET cash_balance_paise=CAST(ROUND(cash_balance*100) AS INTEGER),metal_balance_mg=CAST(ROUND(metal_balance_grams*1000) AS INTEGER)")
+    conn.executescript(r"""
+    CREATE TABLE IF NOT EXISTS sale_returns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      return_no TEXT NOT NULL UNIQUE,
+      client_request_id TEXT UNIQUE,
+      sale_id INTEGER NOT NULL REFERENCES sales(id),
+      customer_id INTEGER REFERENCES customers(id),
+      branch_id INTEGER NOT NULL REFERENCES branches(id),
+      business_date TEXT NOT NULL,
+      taxable_paise INTEGER NOT NULL CHECK(taxable_paise>=0),
+      gst_paise INTEGER NOT NULL CHECK(gst_paise>=0),
+      cgst_paise INTEGER NOT NULL DEFAULT 0 CHECK(cgst_paise>=0),
+      sgst_paise INTEGER NOT NULL DEFAULT 0 CHECK(sgst_paise>=0),
+      igst_paise INTEGER NOT NULL DEFAULT 0 CHECK(igst_paise>=0),
+      round_off_paise INTEGER NOT NULL DEFAULT 0,
+      total_paise INTEGER NOT NULL CHECK(total_paise>=0),
+      refund_cash_paise INTEGER NOT NULL DEFAULT 0 CHECK(refund_cash_paise>=0),
+      refund_card_paise INTEGER NOT NULL DEFAULT 0 CHECK(refund_card_paise>=0),
+      refund_upi_paise INTEGER NOT NULL DEFAULT 0 CHECK(refund_upi_paise>=0),
+      refund_credit_paise INTEGER NOT NULL DEFAULT 0 CHECK(refund_credit_paise>=0),
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted','cancelled')),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      cancelled_at TEXT,
+      cancelled_by INTEGER REFERENCES users(id),
+      CHECK(cgst_paise+sgst_paise+igst_paise=gst_paise),
+      CHECK(refund_cash_paise+refund_card_paise+refund_upi_paise+refund_credit_paise=total_paise)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sale_returns_sale ON sale_returns(sale_id,id);
+    CREATE INDEX IF NOT EXISTS idx_sale_returns_date ON sale_returns(business_date,id);
+    CREATE TABLE IF NOT EXISTS sale_return_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      return_id INTEGER NOT NULL REFERENCES sale_returns(id),
+      sale_item_id INTEGER NOT NULL REFERENCES sale_items(id),
+      item_id INTEGER NOT NULL REFERENCES items(id),
+      tag_no TEXT NOT NULL,
+      taxable_paise INTEGER NOT NULL CHECK(taxable_paise>=0),
+      gst_amount_paise INTEGER NOT NULL CHECK(gst_amount_paise>=0),
+      round_off_paise INTEGER NOT NULL DEFAULT 0,
+      line_total_paise INTEGER NOT NULL CHECK(line_total_paise>=0),
+      cost_amount_paise INTEGER NOT NULL DEFAULT 0 CHECK(cost_amount_paise>=0),
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+    );
+    CREATE INDEX IF NOT EXISTS idx_sale_return_items_return ON sale_return_items(return_id,id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_sale_return_item_active ON sale_return_items(sale_item_id) WHERE active=1;
+
+    CREATE TRIGGER IF NOT EXISTS canonical_customer_balance_insert BEFORE INSERT ON customers
+    WHEN NEW.balance_paise!=CAST(ROUND(NEW.balance*100) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'customer balance mirror mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS canonical_customer_balance_update BEFORE UPDATE OF balance,balance_paise ON customers
+    WHEN NEW.balance_paise!=CAST(ROUND(NEW.balance*100) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'customer balance mirror mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS canonical_supplier_balance_insert BEFORE INSERT ON suppliers
+    WHEN NEW.balance_paise!=CAST(ROUND(NEW.balance*100) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'supplier balance mirror mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS canonical_supplier_balance_update BEFORE UPDATE OF balance,balance_paise ON suppliers
+    WHEN NEW.balance_paise!=CAST(ROUND(NEW.balance*100) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'supplier balance mirror mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS canonical_karigar_balance_insert BEFORE INSERT ON karigars
+    WHEN NEW.cash_balance_paise!=CAST(ROUND(NEW.cash_balance*100) AS INTEGER) OR NEW.metal_balance_mg!=CAST(ROUND(NEW.metal_balance_grams*1000) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'karigar balance mirror mismatch'); END;
+    CREATE TRIGGER IF NOT EXISTS canonical_karigar_balance_update BEFORE UPDATE OF cash_balance,cash_balance_paise,metal_balance_grams,metal_balance_mg ON karigars
+    WHEN NEW.cash_balance_paise!=CAST(ROUND(NEW.cash_balance*100) AS INTEGER) OR NEW.metal_balance_mg!=CAST(ROUND(NEW.metal_balance_grams*1000) AS INTEGER)
+    BEGIN SELECT RAISE(ABORT,'karigar balance mirror mismatch'); END;
+
+    CREATE TRIGGER IF NOT EXISTS sale_returns_financial_no_update BEFORE UPDATE OF
+      return_no,client_request_id,sale_id,customer_id,branch_id,business_date,taxable_paise,gst_paise,cgst_paise,sgst_paise,igst_paise,round_off_paise,total_paise,refund_cash_paise,refund_card_paise,refund_upi_paise,refund_credit_paise,reason,user_id,created_at
+      ON sale_returns BEGIN SELECT RAISE(ABORT,'posted credit-note financial fields are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS sale_returns_no_delete BEFORE DELETE ON sale_returns
+      BEGIN SELECT RAISE(ABORT,'credit notes cannot be deleted; cancel/reverse instead'); END;
+    CREATE TRIGGER IF NOT EXISTS sale_return_items_financial_no_update BEFORE UPDATE OF
+      return_id,sale_item_id,item_id,tag_no,taxable_paise,gst_amount_paise,round_off_paise,line_total_paise,cost_amount_paise
+      ON sale_return_items BEGIN SELECT RAISE(ABORT,'posted credit-note lines are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS sale_return_items_no_delete BEFORE DELETE ON sale_return_items
+      BEGIN SELECT RAISE(ABORT,'credit-note lines cannot be deleted'); END;
+    """)
+    main_branch = conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()
+    if main_branch:
+        bid=int(main_branch[0])
+        if conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Main Counter'",(bid,)).fetchone() and not conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Counter 1'",(bid,)).fetchone():
+            conn.execute("UPDATE counters SET name='Counter 1' WHERE branch_id=? AND name='Main Counter'",(bid,))
+        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(bid,))
+        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 2',1)",(bid,))
+        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 3',1)",(bid,))
+        conn.execute("UPDATE branches SET name='Bijoria Main Showroom' WHERE id=? AND name='Main Showroom'",(bid,))
+    conn.execute("UPDATE settings SET value='Bijoria',updated_at=? WHERE key='business_name' AND value='My Jewellery Store'",(utcnow(),))
+    conn.execute("UPDATE settings SET value='36',updated_at=? WHERE key='business_state_code' AND trim(value)=''",(utcnow(),))
+    conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES('return',0)")
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5))
 
 def _migrate_schema(conn) -> None:
     applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
@@ -406,13 +505,13 @@ DEFAULT_ACCOUNTS=[("1000","Cash","asset"),("1010","Bank / Card / UPI","asset"),(
 
 def init_db(password_hasher)->None:
     with connect() as conn:
-        conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
+        conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(branch_id,)); conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 2',1)",(branch_id,)); conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 3',1)",(branch_id,))
         for code,name,typ in DEFAULT_ACCOUNTS: conn.execute("INSERT OR IGNORE INTO accounts(code,name,account_type,active) VALUES(?,?,?,1)",(code,name,typ))
         for key,name in TALLY_DEFAULT_MAPPINGS.items(): conn.execute("INSERT OR IGNORE INTO tally_ledger_mappings(mapping_key,tally_ledger_name,updated_at) VALUES(?,?,?)",(key,name,now))
-        defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","business_timezone_offset_minutes":"330","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
+        defaults={"business_name":"Bijoria","business_address":"","business_phone":"","business_gstin":"","business_timezone_offset_minutes":"330","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"36","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
         for k,v in defaults.items(): conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(k,v,now))
         if not conn.execute("SELECT id FROM users WHERE username='admin'").fetchone(): conn.execute("INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",("admin",password_hasher("Jewel@123"),"Administrator","admin",now,now))
-        for seq in ("invoice","purchase","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))
+        for seq in ("invoice","purchase","return","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))
         from .integrity import assert_storage_integrity
         assert_storage_integrity(conn)
 

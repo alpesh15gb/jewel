@@ -411,6 +411,43 @@ def _load_payload(conn, row: dict[str, Any], settings: dict[str, str], mappings:
         )
         return xml, _required_static_ledgers(entries, set()), []
 
+    if typ in {"sale_return", "sale_return_cogs"}:
+        ret_row = conn.execute("SELECT * FROM sale_returns WHERE id=?", (entity_id,)).fetchone()
+        if not ret_row:
+            raise TallySyncError(f"Sales return {entity_id} no longer exists")
+        ret = dict(ret_row)
+        sale_row = conn.execute("SELECT * FROM sales WHERE id=?", (ret["sale_id"],)).fetchone()
+        sale = dict(sale_row) if sale_row else {}
+        customer_row = conn.execute("SELECT * FROM customers WHERE id=?", (ret["customer_id"],)).fetchone() if ret.get("customer_id") else None
+        customer = dict(customer_row) if customer_row else None
+        if typ == "sale_return":
+            entries: list[dict[str, Any]] = []
+            party_names: set[str] = set()
+            taxable=qmoney(Decimal(int(ret["taxable_paise"]))/100)
+            gst=qmoney(Decimal(int(ret["gst_paise"]))/100)
+            if taxable: entries.append({"ledger":_mapping(mappings,"sales"),"amount":taxable,"debit":True})
+            for key,mapkey in (("cgst_paise","cgst"),("sgst_paise","sgst"),("igst_paise","igst")):
+                value=qmoney(Decimal(int(ret[key] or 0))/100)
+                if value: entries.append({"ledger":_mapping(mappings,mapkey),"amount":value,"debit":True})
+            ro=qmoney(Decimal(int(ret["round_off_paise"] or 0))/100)
+            if ro: entries.append({"ledger":_mapping(mappings,"round_off"),"amount":abs(ro),"debit":ro>0})
+            cash=qmoney(Decimal(int(ret["refund_cash_paise"] or 0))/100)
+            bank=qmoney(Decimal(int(ret["refund_card_paise"] or 0)+int(ret["refund_upi_paise"] or 0))/100)
+            credit=qmoney(Decimal(int(ret["refund_credit_paise"] or 0))/100)
+            if cash: entries.append({"ledger":_mapping(mappings,"cash"),"amount":cash,"debit":False})
+            if bank: entries.append({"ledger":_mapping(mappings,"bank"),"amount":bank,"debit":False})
+            if credit:
+                if not customer: raise TallySyncError("Customer-account sales return has no customer")
+                party_name=str(customer["name"]);party_names.add(party_name);party_to_create.append((customer,"Sundry Debtors"))
+                entries.append({"ledger":party_name,"amount":credit,"debit":False,"party":True,"bill_ref":sale.get("invoice_no") or ret["return_no"],"bill_type":"Agst Ref"})
+            xml=build_voucher_xml(company=company,voucher_type="Credit Note",voucher_number=ret["return_no"],date=_voucher_date(ret["business_date"]),remote_id=row["remote_id"],entries=entries,narration=f"JewelLAN sales return {ret['return_no']} against {sale.get('invoice_no','')}",action="Cancel" if op=="cancel" else "Create")
+            return xml,_required_static_ledgers(entries,party_names),party_to_create
+        cost_paise=conn.execute("SELECT coalesce(sum(cost_amount_paise),0) v FROM sale_return_items WHERE return_id=?",(entity_id,)).fetchone()["v"]
+        cost=qmoney(Decimal(int(cost_paise or 0))/100)
+        entries=[{"ledger":_mapping(mappings,"inventory"),"amount":cost,"debit":True},{"ledger":_mapping(mappings,"cogs"),"amount":cost,"debit":False}]
+        xml=build_voucher_xml(company=company,voucher_type="Journal",voucher_number=f"{ret['return_no']}-COGS",date=_voucher_date(ret["business_date"]),remote_id=row["remote_id"],entries=entries,narration=f"Restore jewellery cost on {ret['return_no']}",action="Cancel" if op=="cancel" else "Create")
+        return xml,_required_static_ledgers(entries,set()),[]
+
     if typ == "purchase":
         pur_row = conn.execute("SELECT * FROM purchases WHERE id=?", (entity_id,)).fetchone()
         if not pur_row:
