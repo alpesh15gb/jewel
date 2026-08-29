@@ -19,6 +19,17 @@ def _fmt(v: Any) -> str:
         return str(v or "")
 
 
+def _business_heading(settings: dict[str, str], styles) -> list[Any]:
+    center = ParagraphStyle("biz-center", parent=styles["Normal"], fontSize=8, leading=10, alignment=TA_CENTER)
+    story: list[Any] = [Paragraph(f"<b>{settings.get('business_name','Jewellery Store')}</b>", ParagraphStyle("biz-title", parent=styles["Title"], fontSize=15, leading=18))]
+    if settings.get("business_address"):
+        story.append(Paragraph(settings["business_address"], center))
+    bits = [x for x in [settings.get("business_phone"), f"GSTIN: {settings.get('business_gstin')}" if settings.get("business_gstin") else ""] if x]
+    if bits:
+        story.append(Paragraph(" | ".join(bits), center))
+    return story
+
+
 def label_pdf(item: dict[str, Any], settings: dict[str, str]) -> bytes:
     width = float(settings.get("label_width_mm", 60)) * mm
     height = float(settings.get("label_height_mm", 25)) * mm
@@ -40,12 +51,10 @@ def invoice_pdf(sale: dict[str, Any], lines: list[dict[str, Any]], customer: dic
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12*mm, rightMargin=12*mm, topMargin=10*mm, bottomMargin=10*mm, title=sale["invoice_no"])
     styles = getSampleStyleSheet(); normal = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, leading=10); right = ParagraphStyle("right", parent=normal, alignment=TA_RIGHT); center = ParagraphStyle("center", parent=normal, alignment=TA_CENTER)
-    story = [Paragraph(f"<b>{settings.get('business_name','Jewellery Store')}</b>", ParagraphStyle("title", parent=styles["Title"], fontSize=15, leading=18))]
-    if settings.get("business_address"): story.append(Paragraph(settings["business_address"], center))
-    contact_bits = [x for x in [settings.get("business_phone"), f"GSTIN: {settings.get('business_gstin')}" if settings.get("business_gstin") else ""] if x]
-    if contact_bits: story.append(Paragraph(" | ".join(contact_bits), center))
+    story = _business_heading(settings, styles)
     story.append(Spacer(1, 4*mm)); cust = customer or {}
-    header = Table([[Paragraph(f"<b>Tax Invoice</b><br/>Invoice: {sale['invoice_no']}<br/>Date: {sale['created_at'][:19].replace('T',' ')}", normal), Paragraph(f"<b>Customer</b><br/>{cust.get('name','Walk-in Customer')}<br/>{cust.get('phone','')}<br/>{cust.get('gstin','')}", normal)]], colWidths=[90*mm, 90*mm])
+    invoice_date = sale.get("business_date") or str(sale.get("created_at") or "")[:10]
+    header = Table([[Paragraph(f"<b>Tax Invoice</b><br/>Invoice: {sale['invoice_no']}<br/>Date: {invoice_date}", normal), Paragraph(f"<b>Customer</b><br/>{cust.get('name','Walk-in Customer')}<br/>{cust.get('phone','')}<br/>{cust.get('gstin','')}", normal)]], colWidths=[90*mm, 90*mm])
     header.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.5,colors.grey),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)])); story += [header, Spacer(1, 4*mm)]
     data = [["Tag", "Description", "GW", "NW", "Rate/g", "Taxable", "GST", "Total"]]
     for l in lines: data.append([l["tag_no"], Paragraph(f"{l['description']}<br/>{l['metal']} {l['purity']}", normal), f"{l['gross_weight']:.3f}", f"{l['net_weight']:.3f}", _fmt(l["metal_rate"]), _fmt(l["taxable"]), _fmt(l["gst_amount"]), _fmt(l["line_total"])])
@@ -57,6 +66,23 @@ def invoice_pdf(sale: dict[str, Any], lines: list[dict[str, Any]], customer: dic
     totals=[["Subtotal",_fmt(sale["subtotal"])],["Discount",_fmt(sale["discount"])],["Taxable",_fmt(sale["taxable"])],["GST",_fmt(sale["gst"])],["Round off",_fmt(sale["round_off"])],["Grand Total",f"Rs. {_fmt(sale['total'])}"]]
     tt=Table(totals,colWidths=[35*mm,35*mm],hAlign='RIGHT');tt.setStyle(TableStyle([('ALIGN',(1,0),(1,-1),'RIGHT'),('FONTNAME',(0,-1),(-1,-1),'Helvetica-Bold'),('LINEABOVE',(0,-1),(-1,-1),0.7,colors.black),('FONTSIZE',(0,0),(-1,-1),8),('PADDING',(0,0),(-1,-1),3)]));story += [Spacer(1,3*mm),tt]
     pay=f"Cash {_fmt(sale['payment_cash'])} | Card {_fmt(sale['payment_card'])} | UPI {_fmt(sale['payment_upi'])} | Credit {_fmt(sale['payment_credit'])} | Old Gold {_fmt(sale['old_gold_value'])}";story += [Spacer(1,3*mm),Paragraph(pay,right),Spacer(1,8*mm),Paragraph("Thank you for your business.",center)];doc.build(story);return buf.getvalue()
+
+
+def credit_note_pdf(ret: dict[str, Any], items: list[dict[str, Any]], customer: dict[str, Any] | None, settings: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12*mm, rightMargin=12*mm, topMargin=10*mm, bottomMargin=10*mm, title=ret["return_no"])
+    styles = getSampleStyleSheet(); normal = ParagraphStyle("cn-small", parent=styles["Normal"], fontSize=8, leading=10); right = ParagraphStyle("cn-right", parent=normal, alignment=TA_RIGHT); center = ParagraphStyle("cn-center", parent=normal, alignment=TA_CENTER)
+    story = _business_heading(settings, styles); story.append(Spacer(1,4*mm)); cust=customer or {}
+    header=Table([[Paragraph(f"<b>GST Credit Note</b><br/>Credit Note: {ret['return_no']}<br/>Date: {ret.get('business_date','')}<br/>Original Invoice: {ret.get('invoice_no','')}",normal),Paragraph(f"<b>Customer</b><br/>{cust.get('name',ret.get('customer_name') or 'Walk-in Customer')}<br/>{cust.get('phone','')}<br/>{cust.get('gstin','')}",normal)]],colWidths=[90*mm,90*mm])
+    header.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.5,colors.grey),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)]));story += [header,Spacer(1,4*mm)]
+    data=[["Tag","Taxable","GST","Round off","Credit"]]
+    for x in items:data.append([x.get('tag_no',''),_fmt(x.get('taxable')), _fmt(x.get('gst_amount')), _fmt(x.get('round_off')), _fmt(x.get('line_total'))])
+    t=Table(data,repeatRows=1,colWidths=[55*mm,30*mm,30*mm,30*mm,35*mm]);t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#eeeeee')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),8),('GRID',(0,0),(-1,-1),0.35,colors.grey),('ALIGN',(1,1),(-1,-1),'RIGHT'),('PADDING',(0,0),(-1,-1),4)]));story.append(t)
+    totals=[["Taxable",_fmt(ret.get('taxable'))],["CGST",_fmt(ret.get('cgst'))],["SGST",_fmt(ret.get('sgst'))],["IGST",_fmt(ret.get('igst'))],["GST Total",_fmt(ret.get('gst'))],["Round off",_fmt(ret.get('round_off'))],["Credit Note Total",f"Rs. {_fmt(ret.get('total'))}"]]
+    tt=Table(totals,colWidths=[38*mm,38*mm],hAlign='RIGHT');tt.setStyle(TableStyle([('ALIGN',(1,0),(1,-1),'RIGHT'),('FONTNAME',(0,-1),(-1,-1),'Helvetica-Bold'),('LINEABOVE',(0,-1),(-1,-1),0.7,colors.black),('FONTSIZE',(0,0),(-1,-1),8),('PADDING',(0,0),(-1,-1),3)]));story += [Spacer(1,3*mm),tt]
+    refund=f"Refund: Cash {_fmt(ret.get('refund_cash'))} | Card {_fmt(ret.get('refund_card'))} | UPI {_fmt(ret.get('refund_upi'))} | Customer A/c {_fmt(ret.get('refund_credit'))}";story += [Spacer(1,3*mm),Paragraph(refund,right),Spacer(1,2*mm),Paragraph(f"Reason: {ret.get('reason','')}",normal)]
+    if ret.get('status')=='cancelled':story += [Spacer(1,3*mm),Paragraph("<b>CANCELLED / REVERSED</b>",center)]
+    story += [Spacer(1,8*mm),Paragraph("This credit note references the original tax invoice shown above.",center)];doc.build(story);return buf.getvalue()
 
 
 def stock_report_pdf(rows: list[dict[str, Any]], settings: dict[str, str], title: str = "Stock Report") -> bytes:
