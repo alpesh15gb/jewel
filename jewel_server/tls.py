@@ -58,11 +58,18 @@ def _restrict_private_key(path: Path) -> None:
         except OSError:
             pass
         return
-    # The production server runs as SYSTEM. Remove inherited ACLs and allow only
-    # SYSTEM and local Administrators to read the private key.
+    # Use well-known SIDs rather than localized group names. The server task
+    # runs as LocalSystem; local Administrators retain emergency recovery access.
     try:
         subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", "SYSTEM:F", "Administrators:F"],
+            [
+                "icacls",
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F",
+            ],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
