@@ -21,6 +21,10 @@ jobs:
       - name: Apply and compile backend completion
         shell: pwsh
         run: |
+          $p = 'scripts/apply_backend_completion.py'
+          $c = Get-Content $p -Raw
+          $c = $c.Replace("if __name__=='__main__':\n    patch_returns", "if __name__=='__main__':`r`n    patch_returns")
+          Set-Content -Path $p -Value $c -Encoding utf8 -NoNewline
           python scripts/apply_backend_completion.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m compileall -q jewel_client jewel_server jewel_tally_bridge tests scripts
