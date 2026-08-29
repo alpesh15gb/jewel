@@ -36,20 +36,22 @@ jobs:
           --collect-all requests --collect-all reportlab --hidden-import serial
           run_client.py
 
-      - name: Verify bundled application packages
+      - name: Verify PyInstaller analysis includes local packages
         shell: pwsh
         run: |
-          $client = python -m PyInstaller.utils.cliutils.archive_viewer -l dist/JewelPOS.exe | Out-String
-          if ($client -notmatch 'jewel_client\.main') { throw 'JewelPOS.exe is missing jewel_client.main' }
-          if ($client -notmatch 'jewel_client\.api') { throw 'JewelPOS.exe is missing jewel_client.api' }
-          $server = python -m PyInstaller.utils.cliutils.archive_viewer -l dist/JewelServer.exe | Out-String
-          if ($server -notmatch 'jewel_server\.main') { throw 'JewelServer.exe is missing jewel_server.main' }
+          $client = Get-Content build\JewelPOS\Analysis-00.toc -Raw
+          if ($client -notmatch 'jewel_client\.main') { throw 'PyInstaller analysis is missing jewel_client.main' }
+          if ($client -notmatch 'jewel_client\.api') { throw 'PyInstaller analysis is missing jewel_client.api' }
+          if ($client -notmatch 'jewel_client\.config') { throw 'PyInstaller analysis is missing jewel_client.config' }
+          if ($client -notmatch 'jewel_client\.scale') { throw 'PyInstaller analysis is missing jewel_client.scale' }
+          $server = Get-Content build\JewelServer\Analysis-00.toc -Raw
+          if ($server -notmatch 'jewel_server\.main') { throw 'PyInstaller analysis is missing jewel_server.main' }
 
       - name: Smoke test JewelPOS launch
         shell: pwsh
         run: |
           $p = Start-Process -FilePath .\dist\JewelPOS.exe -PassThru
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 7
           if ($p.HasExited) { throw "JewelPOS.exe exited during launch smoke test with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id -Force
 
