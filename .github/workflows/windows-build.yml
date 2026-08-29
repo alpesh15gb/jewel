@@ -47,7 +47,7 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_server.audit_chain, jewel_server.canonical, jewel_server.integrity, jewel_server.precision, jewel_server.tls, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
+          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_client.returns_page, jewel_server.main, jewel_server.returns, jewel_server.tally, jewel_server.audit_chain, jewel_server.canonical, jewel_server.integrity, jewel_server.precision, jewel_server.tls, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test redesigned desktop UI
@@ -56,6 +56,7 @@ jobs:
           @'
           import tkinter as tk
           from jewel_client.main import AdminPage, App, POSPage, TallyPage
+          from jewel_client.returns_page import ReturnsPage
 
           class DummyApi:
               base_url = 'https://127.0.0.1:8765'
@@ -66,6 +67,8 @@ jobs:
                       return {'business_date':'2026-08-30','stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'c': 0, 'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
                   if path == '/api/tally/status':
                       return {'enabled':'0','bridge_url':'http://127.0.0.1:8767','company':'','business_state_code':'','auto_create_parties':'1','mappings':{},'queue':{},'bridge':None}
+                  if path == '/api/sales': return []
+                  if path == '/api/returns': return []
                   if path == '/api/customers': return []
                   if path == '/api/suppliers': return []
                   if path == '/api/karigars': return []
@@ -91,9 +94,10 @@ jobs:
           root.update_idletasks(); assert app.winfo_exists()
           app.show(POSPage, 'Billing'); root.update_idletasks(); assert app.current_page.scan_entry.winfo_exists()
           app.show(TallyPage, 'TallyPrime'); root.update_idletasks(); assert app.current_page.winfo_exists()
+          app.show(ReturnsPage, 'Returns & Credit Notes'); root.update_idletasks(); assert app.current_page.returns_tree.winfo_exists()
           app.show(AdminPage, 'Administration'); root.update_idletasks(); assert app.current_page.health_text.winfo_exists()
           root.destroy()
-          print('Dashboard, Billing, Tally and Data Health screens constructed successfully.')
+          print('Dashboard, Billing, Returns, Tally and Data Health screens constructed successfully.')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -110,7 +114,7 @@ jobs:
           --hidden-import jewel_server.backup --hidden-import jewel_server.discovery
           --hidden-import jewel_server.audit_chain --hidden-import jewel_server.canonical
           --hidden-import jewel_server.integrity --hidden-import jewel_server.precision
-          --hidden-import jewel_server.tally --hidden-import jewel_server.tls
+          --hidden-import jewel_server.returns --hidden-import jewel_server.tally --hidden-import jewel_server.tls
           --collect-all cryptography
           --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab --collect-all requests
           run_server.py
@@ -122,6 +126,7 @@ jobs:
           --hidden-import jewel_client --hidden-import jewel_client.main
           --hidden-import jewel_client.api --hidden-import jewel_client.config
           --hidden-import jewel_client.scale --hidden-import jewel_client.ui_theme
+          --hidden-import jewel_client.returns_page
           --collect-all requests --collect-all reportlab --hidden-import serial
           run_client.py
 

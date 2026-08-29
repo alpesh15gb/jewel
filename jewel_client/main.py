@@ -14,6 +14,7 @@ from .api import Api, ApiError, discover_servers, format_fingerprint, probe_serv
 from .config import load_config, save_config
 from .scale import read_scale
 from .ui_theme import PALETTE, apply_theme, card, divider, status_pill
+from .returns_page import ReturnsPage
 
 APP_TITLE = "JewelLAN Jewellery ERP"
 PRODUCTION_HARDENED_V1 = True
@@ -245,6 +246,7 @@ class App(ttk.Frame):
         role = self.user.get("role", "cashier")
         pages = [("Overview", DashboardPage), ("Inventory", InventoryPage), ("Parties", PartiesPage)]
         if role in ("admin","manager","cashier"): pages.insert(1, ("Billing", POSPage))
+        if role in ("admin","manager"): pages.insert(2, ("Returns & Credit Notes", ReturnsPage))
         if role in ("admin","manager","inventory"): pages.append(("Purchases", PurchasesPage))
         if role in ("admin","manager","cashier"): pages.append(("Repairs & Orders", JobsPage))
         if role in ("admin","manager","inventory"): pages.append(("Stock Audit", StockAuditPage))
