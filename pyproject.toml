@@ -1,0 +1,9 @@
+[project]
+name = "jewellan"
+version = "1.0.0"
+description = "Offline-first LAN jewellery ERP and POS for Windows"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
