@@ -1,0 +1,30 @@
+name: Sync UI upgrade dialog template
+
+on:
+  push:
+    branches: [fix-scrollable-item-dialog]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-scrollable-item-dialog
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Sync UI upgrade dialog template
+        run: python scripts/dev_sync_ui_upgrade_dialog.py
+      - name: Commit generated source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/apply_ui_redesign.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Keep UI redesign upgrade script idempotent"
+          git push origin HEAD:fix-scrollable-item-dialog
