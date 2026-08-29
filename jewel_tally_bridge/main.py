@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 import xml.etree.ElementTree as ET
 
+from .xml_compat import parse_tally_xml
+
 import requests
 import uvicorn
 from fastapi import Body, FastAPI, Header, HTTPException, Query
@@ -95,7 +97,7 @@ def _int_any(root: ET.Element, name: str) -> int:
 
 def parse_import_response(xml: str) -> dict[str, Any]:
     try:
-        root = ET.fromstring(xml)
+        root = parse_tally_xml(xml)
     except ET.ParseError as exc:
         raise HTTPException(502, f"TallyPrime returned malformed XML: {exc}") from exc
     line_errors = []
@@ -143,13 +145,12 @@ def list_ledgers_xml(company: str) -> str:
     coll = ET.SubElement(msg, "COLLECTION", {"NAME": "JewelLAN Ledgers", "ISINITIALIZE": "Yes"})
     ET.SubElement(coll, "TYPE").text = "Ledger"
     ET.SubElement(coll, "NATIVEMETHOD").text = "Name"
-    ET.SubElement(coll, "NATIVEMETHOD").text = "Parent"
     return ET.tostring(root, encoding="unicode")
 
 
 def parse_ledgers(xml: str) -> list[str]:
     try:
-        root = ET.fromstring(xml)
+        root = parse_tally_xml(xml)
     except ET.ParseError as exc:
         raise HTTPException(502, f"Could not parse Tally ledger response: {exc}") from exc
     names = set()
@@ -219,7 +220,7 @@ def daybook_xml(company: str, date_from: str, date_to: str) -> str:
 
 def parse_daybook(xml: str) -> list[dict[str, Any]]:
     try:
-        root = ET.fromstring(xml)
+        root = parse_tally_xml(xml)
     except ET.ParseError as exc:
         raise HTTPException(502, f"Could not parse Tally Day Book: {exc}") from exc
     out = []
