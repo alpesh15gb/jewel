@@ -116,7 +116,7 @@ def post_sale(conn,payload,user,client_ip=None):
     for og in olds:
         gross=weight(og.get('gross_weight'));ded=decimal_value(og.get('deduction_percent',0));net=weight(weight_decimal(gross)*(decimal_value(100)-ded)/decimal_value(100));pure=weight(weight_decimal(net)*decimal_value(purity_fraction(str(og.get('purity','999')))));conn.execute('INSERT INTO old_gold(sale_id,customer_id,metal,purity,gross_weight,deduction_percent,net_weight,pure_weight,rate,value,notes,received_at,received_by,gross_mg,net_mg,pure_mg,rate_paise,value_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,cid,og.get('metal','Gold'),og.get('purity','999'),gross,ded,net,pure,money(og.get('rate')),money(og.get('value')),og.get('notes'),now,user['id'],weight_mg(gross),weight_mg(net),weight_mg(pure),money_paise(og.get('rate')),money_paise(og.get('value'))))
     if cid and credit:
-        row=c.execute('SELECT balance_paise FROM customers WHERE id=?',(cid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(credit);c.execute('UPDATE customers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(paise_money(newp),newp,now,cid))
+        row=conn.execute('SELECT balance_paise FROM customers WHERE id=?',(cid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(credit);conn.execute('UPDATE customers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(paise_money(newp),newp,now,cid))
     jl=[]
     if cash:jl.append(('1000',cash,0,None,None))
     if card+upi:jl.append(('1010',money(card+upi),0,None,None))

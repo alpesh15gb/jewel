@@ -141,6 +141,26 @@ def _add_column_if_missing(conn, table: str, name: str, spec: str) -> None:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
 
 
+def _execute_script_in_transaction(conn, script: str) -> None:
+    """Execute multi-statement migration SQL without sqlite3.executescript().
+
+    sqlite3.executescript() implicitly commits any active transaction, which breaks
+    our atomic migration wrapper. sqlite3.complete_statement() understands trigger
+    bodies, so statements can be executed one by one while the caller's transaction
+    remains active.
+    """
+    pending = ""
+    for line in script.splitlines():
+        pending += line + "\n"
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                conn.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise sqlite3.OperationalError("Incomplete SQL statement in schema migration")
+
+
 def _migration_1(conn) -> None:
     for name, spec in {
         "place_of_supply_code": "TEXT",
@@ -381,7 +401,7 @@ def _migration_5(conn) -> None:
     conn.execute("UPDATE customers SET balance_paise=CAST(ROUND(balance*100) AS INTEGER)")
     conn.execute("UPDATE suppliers SET balance_paise=CAST(ROUND(balance*100) AS INTEGER)")
     conn.execute("UPDATE karigars SET cash_balance_paise=CAST(ROUND(cash_balance*100) AS INTEGER),metal_balance_mg=CAST(ROUND(metal_balance_grams*1000) AS INTEGER)")
-    conn.executescript(r"""
+    _execute_script_in_transaction(conn, r"""
     CREATE TABLE IF NOT EXISTS sale_returns (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       return_no TEXT NOT NULL UNIQUE,
