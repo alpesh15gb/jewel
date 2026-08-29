@@ -54,9 +54,9 @@ Name: "{commonappdata}\JewelLAN\bin"; Components: server
 Name: "{commonappdata}\JewelLAN\backups"; Components: server
 
 [Files]
-Source: "..\dist\{#MyServerExe}"; DestDir: "{commonappdata}\JewelLAN\bin"; DestName: "{#MyServerExe}"; Flags: ignoreversion; Components: server
-Source: "..\dist\{#MyClientExe}"; DestDir: "{app}"; DestName: "{#MyClientExe}"; Flags: ignoreversion; Components: client
-Source: "..\dist\{#MyBridgeExe}"; DestDir: "{commonappdata}\JewelLAN\bin"; DestName: "{#MyBridgeExe}"; Flags: ignoreversion; Components: tallybridge
+Source: "..\dist\{#MyServerExe}"; DestDir: "{commonappdata}\JewelLAN\bin"; DestName: "{#MyServerExe}"; Flags: ignoreversion restartreplace; Components: server
+Source: "..\dist\{#MyClientExe}"; DestDir: "{app}"; DestName: "{#MyClientExe}"; Flags: ignoreversion restartreplace; Components: client
+Source: "..\dist\{#MyBridgeExe}"; DestDir: "{commonappdata}\JewelLAN\bin"; DestName: "{#MyBridgeExe}"; Flags: ignoreversion restartreplace; Components: tallybridge
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion; Components: client
 Source: "..\docs\OPERATIONS.md"; DestDir: "{app}\docs"; Flags: ignoreversion; Components: client
 
@@ -79,7 +79,6 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""J
 Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""JewelLAN Server"" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR ""{commonappdata}\JewelLAN\bin\{#MyServerExe} --host 0.0.0.0 --port 8765"" /F"; Flags: runhidden; Components: server
 Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""JewelLAN Server"""; Flags: runhidden; Components: server
 
-
 ; Tally Bridge is exposed only to the Private LAN; TallyPrime itself remains localhost-only.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""JewelLAN Tally Bridge TCP"""; Flags: runhidden; Components: tallybridge
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""JewelLAN Tally Bridge"" /F"; Flags: runhidden; Components: tallybridge
@@ -91,34 +90,43 @@ Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""JewelLAN Tally Bridge"""
 Filename: "{app}\{#MyClientExe}"; Description: "Launch JewelLAN POS"; Flags: nowait postinstall skipifsilent; Components: client
 
 [UninstallRun]
-; Stop/remove the service task and LAN firewall rules. Database/backups are intentionally preserved.
+; Stop/remove tasks and processes before deleting binaries. Database/backups are intentionally preserved.
 Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""JewelLAN Server"""; Flags: runhidden
+Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""JewelLAN Tally Bridge"""; Flags: runhidden
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""JewelLAN Server"" /F"; Flags: runhidden
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""JewelLAN Tally Bridge"" /F"; Flags: runhidden
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM JewelServer.exe"; Flags: runhidden
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM JewelTallyBridge.exe"; Flags: runhidden
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM JewelPOS.exe"; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""JewelLAN Server TCP"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""JewelLAN Discovery UDP"""; Flags: runhidden
-Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""JewelLAN Tally Bridge"""; Flags: runhidden
-Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""JewelLAN Tally Bridge"" /F"; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""JewelLAN Tally Bridge TCP"""; Flags: runhidden
 
 [Code]
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+procedure StopJewelLANForUpgrade;
 var
   ResultCode: Integer;
 begin
+  { JEWELLAN_UPGRADE_LOCK_HARDENING }
+  { End and remove scheduled tasks before Inno tries to replace the EXEs. }
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN "JewelLAN Server"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN "JewelLAN Tally Bridge"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN "JewelLAN Server" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN "JewelLAN Tally Bridge" /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  { A task can report ended while its child process still owns the executable. }
+  { Force-close every JewelLAN binary and wait synchronously for taskkill. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM JewelServer.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM JewelTallyBridge.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM JewelPOS.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  { Give Windows/AV a short window to release final image handles. }
+  Sleep(1200);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
   Result := '';
   NeedsRestart := False;
-
-  { Stop an existing server before replacing its executable during upgrades. }
-  if WizardIsComponentSelected('server') then
-  begin
-    Exec(ExpandConstant('{sys}\schtasks.exe'),
-      '/End /TN "JewelLAN Server"', '', SW_HIDE,
-      ewWaitUntilTerminated, ResultCode);
-    Sleep(750);
-  end;
-  if WizardIsComponentSelected('tallybridge') then
-  begin
-    Exec(ExpandConstant('{sys}\schtasks.exe'), '/End /TN "JewelLAN Tally Bridge"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Sleep(500);
-  end;
+  StopJewelLANForUpgrade;
 end;
