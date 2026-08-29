@@ -47,7 +47,7 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
+          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_server.audit_chain, jewel_server.canonical, jewel_server.integrity, jewel_server.precision, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test redesigned desktop UI
@@ -55,15 +55,15 @@ jobs:
         run: |
           @'
           import tkinter as tk
-          from jewel_client.main import App, POSPage, TallyPage
+          from jewel_client.main import AdminPage, App, POSPage, TallyPage
 
           class DummyApi:
               base_url = 'http://127.0.0.1:8765'
               def get(self, path, **params):
                   if path == '/api/settings':
-                      return {'settings': {'business_name': 'JewelLAN CI'}, 'branches': [], 'counters': []}
+                      return {'settings': {'business_name': 'JewelLAN CI', 'business_timezone_offset_minutes':'330'}, 'branches': [], 'counters': []}
                   if path == '/api/dashboard':
-                      return {'stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'c': 0, 'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
+                      return {'business_date':'2026-08-30','stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'c': 0, 'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
                   if path == '/api/tally/status':
                       return {'enabled':'0','bridge_url':'http://127.0.0.1:8767','company':'','business_state_code':'','auto_create_parties':'1','mappings':{},'queue':{},'bridge':None}
                   if path == '/api/customers': return []
@@ -74,6 +74,12 @@ jobs:
                   if path == '/api/orders': return []
                   if path == '/api/rates': return []
                   if path == '/api/users': return []
+                  if path == '/api/integrity':
+                      return {'ok':True,'sqlite_quick_check':['ok'],'foreign_key_violations':0,'issue_count':0,'audit_chain':{'ok':True},'canonical':{'ok':True,'mismatches':0},'issues':[]}
+                  if path == '/api/reports/day-close':
+                      return {'date':'2026-08-30','sales':{'count':0,'total':0,'payments_match_sales':True},'journal':{'balanced':True}}
+                  if path == '/api/health':
+                      return {'ok':True,'backup':{'ok':True,'at':'2026-08-30T00:00:00+00:00'}}
                   raise RuntimeError(f'Unexpected GUI smoke-test GET: {path}')
               def post(self, path, data):
                   if path == '/api/sales/quote':
@@ -85,8 +91,9 @@ jobs:
           root.update_idletasks(); assert app.winfo_exists()
           app.show(POSPage, 'Billing'); root.update_idletasks(); assert app.current_page.scan_entry.winfo_exists()
           app.show(TallyPage, 'TallyPrime'); root.update_idletasks(); assert app.current_page.winfo_exists()
+          app.show(AdminPage, 'Administration'); root.update_idletasks(); assert app.current_page.health_text.winfo_exists()
           root.destroy()
-          print('Redesigned Dashboard, Billing and Tally screens constructed successfully.')
+          print('Dashboard, Billing, Tally and Data Health screens constructed successfully.')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -101,6 +108,8 @@ jobs:
           --hidden-import jewel_server.db --hidden-import jewel_server.services
           --hidden-import jewel_server.security --hidden-import jewel_server.pdfs
           --hidden-import jewel_server.backup --hidden-import jewel_server.discovery
+          --hidden-import jewel_server.audit_chain --hidden-import jewel_server.canonical
+          --hidden-import jewel_server.integrity --hidden-import jewel_server.precision
           --hidden-import jewel_server.tally
           --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab --collect-all requests
           run_server.py
