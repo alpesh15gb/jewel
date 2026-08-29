@@ -7,7 +7,7 @@ JewelLAN is designed for a jewellery showroom where the internet can be unplugge
 ## What is implemented
 
 - Proper Windows `JewelLAN-Setup.exe` installer
-- Installer modes: **Server + Counter**, **Server only**, **Counter only**
+- Installer modes: **Server + Counter**, **Server + Counter + Tally Bridge**, **Server only**, **Counter only**, **Tally Bridge only**
 - Automatic server startup and Private-LAN firewall configuration
 - LAN server auto-discovery; manual IP configuration also works
 - Role-based users: admin, manager, cashier, inventory and accounts
@@ -56,12 +56,16 @@ No PowerShell commands are required.
 During setup choose one of these modes:
 
 - **Server + Counter** — recommended on the main showroom/server PC.
+- **Server + Counter + Tally Bridge** — use when the main PC also runs TallyPrime.
 - **Server only** — database/LAN host without a billing shortcut.
 - **Counter only** — install on additional billing, inventory or office PCs.
+- **Tally Bridge only** — install on a separate PC that runs TallyPrime.
 
 The installer automatically:
 
 - installs the selected application components;
+- stops/removes existing JewelLAN background tasks and closes lingering JewelLAN executables before an in-place upgrade, preventing locked-EXE permission errors;
+- uses a reboot-safe replacement fallback if Windows still holds an executable handle;
 - stores the server binary and data under `C:\ProgramData\JewelLAN`;
 - opens TCP `8765` and UDP `8766` only for the Windows **Private** network profile;
 - registers the server to start automatically at Windows boot;
