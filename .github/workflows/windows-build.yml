@@ -47,7 +47,7 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_server.audit_chain, jewel_server.canonical, jewel_server.integrity, jewel_server.precision, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
+          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_server.audit_chain, jewel_server.canonical, jewel_server.integrity, jewel_server.precision, jewel_server.tls, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test redesigned desktop UI
@@ -58,7 +58,7 @@ jobs:
           from jewel_client.main import AdminPage, App, POSPage, TallyPage
 
           class DummyApi:
-              base_url = 'http://127.0.0.1:8765'
+              base_url = 'https://127.0.0.1:8765'
               def get(self, path, **params):
                   if path == '/api/settings':
                       return {'settings': {'business_name': 'JewelLAN CI', 'business_timezone_offset_minutes':'330'}, 'branches': [], 'counters': []}
@@ -110,7 +110,8 @@ jobs:
           --hidden-import jewel_server.backup --hidden-import jewel_server.discovery
           --hidden-import jewel_server.audit_chain --hidden-import jewel_server.canonical
           --hidden-import jewel_server.integrity --hidden-import jewel_server.precision
-          --hidden-import jewel_server.tally
+          --hidden-import jewel_server.tally --hidden-import jewel_server.tls
+          --collect-all cryptography
           --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab --collect-all requests
           run_server.py
 
@@ -136,6 +137,9 @@ jobs:
       - name: Self-test packaged executables
         shell: pwsh
         run: |
+          $env:JEWELLAN_DATA_DIR = "$pwd\dist\ci-data"
+          & .\dist\JewelServer.exe --show-fingerprint
+          if ($LASTEXITCODE -ne 0) { throw "JewelServer.exe TLS self-test failed: $LASTEXITCODE" }
           $p = Start-Process -FilePath .\dist\JewelPOS.exe -ArgumentList '--self-test' -PassThru
           if (-not $p.WaitForExit(15000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; throw 'JewelPOS.exe self-test did not exit.' }
           if ($p.ExitCode -ne 0) { throw "JewelPOS.exe self-test failed: $($p.ExitCode)" }
