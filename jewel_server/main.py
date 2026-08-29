@@ -1,0 +1,339 @@
+from __future__ import annotations
+import argparse,datetime as dt,os,socket
+from contextlib import asynccontextmanager
+from typing import Any
+import uvicorn
+from fastapi import Body,Depends,FastAPI,HTTPException,Query,Request
+from fastapi.responses import Response
+from .backup import BackupWorker,create_backup,list_backups,restore_backup
+from .db import audit,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
+from .discovery import DiscoveryResponder
+from .pdfs import invoice_pdf,label_pdf,stock_report_pdf
+from .security import create_session,current_user,hash_password,require,verify_password
+from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
+
+backup_worker=None;discovery=None
+@asynccontextmanager
+async def lifespan(app):
+    global backup_worker,discovery
+    init_db(hash_password);backup_worker=BackupWorker();backup_worker.start();port=int(os.environ.get('JEWELLAN_PORT','8765'));discovery=DiscoveryResponder(port);discovery.start();yield
+    if backup_worker:backup_worker.stop()
+    if discovery:discovery.stop()
+app=FastAPI(title='JewelLAN Server',version='1.0.0',lifespan=lifespan,docs_url='/api/docs',redoc_url=None)
+def ip(req):return req.client.host if req.client else 'unknown'
+
+@app.get('/api/health')
+def health():
+    with read_db() as c:c.execute('SELECT 1');s=get_settings(c)
+    return {'ok':True,'product':'JewelLAN','version':'1.0.0','business':s.get('business_name','Jewellery Store'),'time':utcnow()}
+@app.post('/api/auth/login')
+def login(req:Request,p:dict=Body(...)):
+    with read_db() as c:u=c.execute('SELECT * FROM users WHERE username=? COLLATE NOCASE',(str(p.get('username') or '').strip(),)).fetchone()
+    if not u or not u['active'] or not verify_password(str(p.get('password') or ''),u['password_hash']):raise HTTPException(401,'Invalid username or password')
+    token=create_session(u['id'],str(p.get('client_name') or 'Windows Client'))
+    with write_db() as c:audit(c,u['id'],'login','user',u['id'],None,ip(req))
+    return {'token':token,'user':{k:u[k] for k in ('id','username','full_name','role','must_change_password')}}
+@app.post('/api/auth/logout')
+def logout(u=Depends(current_user)):
+    with write_db() as c:c.execute('DELETE FROM sessions WHERE token_hash=?',(u['token_hash'],))
+    return {'ok':True}
+@app.get('/api/auth/me')
+def me(u=Depends(current_user)):return {k:u[k] for k in ('id','username','full_name','role','must_change_password')}
+@app.post('/api/auth/change-password')
+def change_password(p:dict=Body(...),u=Depends(current_user)):
+    new=str(p.get('new_password') or '')
+    if len(new)<8:raise HTTPException(400,'New password must be at least 8 characters')
+    with write_db() as c:
+        r=c.execute('SELECT password_hash FROM users WHERE id=?',(u['id'],)).fetchone()
+        if not r or not verify_password(str(p.get('old_password') or ''),r[0]):raise HTTPException(400,'Current password is incorrect')
+        c.execute('UPDATE users SET password_hash=?,must_change_password=0,updated_at=? WHERE id=?',(hash_password(new),utcnow(),u['id']));audit(c,u['id'],'change_password','user',u['id'])
+    return {'ok':True}
+
+@app.get('/api/dashboard')
+def dashboard(u=Depends(require('dashboard'))):
+    today=dt.date.today().isoformat()
+    with read_db() as c:
+        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_weight),0) gw,coalesce(sum(net_weight),0) nw,coalesce(sum(cost_amount),0) cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total),0) total FROM sales WHERE status='posted' AND substr(created_at,1,10)=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
+    return {'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
+@app.get('/api/settings')
+def settings(u=Depends(current_user)):
+    with read_db() as c:return {'settings':get_settings(c),'branches':rowsdict(c.execute('SELECT * FROM branches WHERE active=1 ORDER BY name').fetchall()),'counters':rowsdict(c.execute('SELECT * FROM counters WHERE active=1 ORDER BY branch_id,name').fetchall())}
+@app.put('/api/settings')
+def save_settings(p:dict=Body(...),u=Depends(require('*'))):
+    allowed={'business_name','business_address','business_phone','business_gstin','currency','invoice_prefix','tag_prefix','gst_default','label_width_mm','label_height_mm','backup_interval_hours','backup_retention_days'}
+    with write_db() as c:
+        for k,v in p.items():
+            if k in allowed:set_setting(c,k,str(v))
+        audit(c,u['id'],'update','settings',None,p)
+    return {'ok':True}
+@app.get('/api/users')
+def users(u=Depends(require('*'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT id,username,full_name,role,active,must_change_password,created_at,updated_at FROM users ORDER BY username').fetchall())
+@app.post('/api/users')
+def add_user(p:dict=Body(...),u=Depends(require('*'))):
+    username=str(p.get('username') or '').strip();password=str(p.get('password') or '');role=str(p.get('role') or 'cashier')
+    if not username or len(password)<8 or role not in {'admin','manager','cashier','inventory','accounts'}:raise HTTPException(400,'Valid username, role and 8+ character password required')
+    with write_db() as c:
+        try:cur=c.execute('INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)',(username,hash_password(password),p.get('full_name') or username,role,utcnow(),utcnow()))
+        except Exception as e:raise HTTPException(409,f'Could not create user: {e}')
+        audit(c,u['id'],'create','user',cur.lastrowid,{'username':username,'role':role});return {'id':cur.lastrowid}
+@app.put('/api/users/{uid}')
+def edit_user(uid:int,p:dict=Body(...),u=Depends(require('*'))):
+    with write_db() as c:
+        r=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+        if not r:raise HTTPException(404,'User not found')
+        active=1 if p.get('active',bool(r['active'])) else 0
+        if uid==u['id'] and not active:raise HTTPException(400,'Cannot deactivate yourself')
+        c.execute('UPDATE users SET full_name=?,role=?,active=?,updated_at=? WHERE id=?',(p.get('full_name',r['full_name']),p.get('role',r['role']),active,utcnow(),uid))
+        if p.get('password'):c.execute('UPDATE users SET password_hash=?,must_change_password=1,updated_at=? WHERE id=?',(hash_password(str(p['password'])),utcnow(),uid))
+        audit(c,u['id'],'update','user',uid,p)
+    return {'ok':True}
+
+@app.get('/api/rates')
+def rates(u=Depends(current_user)):
+    with read_db() as c:return rowsdict(c.execute('SELECT * FROM metal_rates ORDER BY effective_at DESC,id DESC LIMIT 100').fetchall())
+@app.post('/api/rates')
+def add_rate(p:dict=Body(...),u=Depends(require('rates'))):
+    rate=float(p.get('rate_per_gram') or 0)
+    if rate<=0:raise HTTPException(400,'Rate must be positive')
+    with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by) VALUES(?,?,?,?,?)',(p.get('metal') or 'Gold',p.get('purity') or '916',rate,p.get('effective_at') or utcnow(),u['id']));audit(c,u['id'],'create','metal_rate',cur.lastrowid,p);return {'id':cur.lastrowid}
+
+@app.get('/api/items')
+def items(q:str='',status:str='',branch_id:int|None=None,category:str='',limit:int=Query(500,le=2000),u=Depends(require('inventory.read'))):
+    w=[];a=[]
+    if q:w.append('(tag_no LIKE ? OR barcode LIKE ? OR name LIKE ? OR huid LIKE ? OR certificate_no LIKE ? OR rfid_epc LIKE ?)');a += [f'%{q}%']*6
+    if status:w.append('status=?');a.append(status)
+    if branch_id:w.append('branch_id=?');a.append(branch_id)
+    if category:w.append('category=?');a.append(category)
+    a.append(limit);sql='SELECT * FROM items'+(' WHERE '+' AND '.join(w) if w else '')+' ORDER BY id DESC LIMIT ?'
+    with read_db() as c:return rowsdict(c.execute(sql,a).fetchall())
+@app.get('/api/items/barcode/{code}')
+def by_barcode(code:str,u=Depends(require('inventory.read'))):
+    with read_db() as c:
+        r=c.execute('SELECT * FROM items WHERE barcode=? COLLATE NOCASE OR tag_no=? COLLATE NOCASE OR rfid_epc=?',(code,code,code)).fetchone()
+        if not r:raise HTTPException(404,'Tag/barcode not found')
+        out=dict(r)
+        try:out['current_rate']=latest_rate(c,r['metal'],r['purity'])
+        except:out['current_rate']=0
+        return out
+@app.get('/api/items/{iid}')
+def item(iid:int,u=Depends(require('inventory.read'))):
+    with read_db() as c:
+        r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+        if not r:raise HTTPException(404,'Item not found')
+        return {'item':dict(r),'movements':rowsdict(c.execute('SELECT * FROM stock_movements WHERE item_id=? ORDER BY id DESC LIMIT 100',(iid,)).fetchall())}
+@app.post('/api/items')
+def add_item(req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
+    with write_db() as c:return create_item(c,p,u['id'],ip(req))
+@app.put('/api/items/{iid}')
+def edit_item(iid:int,req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
+    with write_db() as c:return update_item(c,iid,p,u['id'],ip(req))
+@app.post('/api/items/{iid}/transfer')
+def move_item(iid:int,req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
+    with write_db() as c:return transfer_item(c,iid,int(p.get('branch_id') or 1),p.get('counter_id'),u['id'],str(p.get('note') or ''),ip(req))
+@app.get('/api/items/{iid}/label.pdf')
+def tag_pdf(iid:int,u=Depends(require('inventory.read'))):
+    with read_db() as c:
+        r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+        if not r:raise HTTPException(404,'Item not found')
+        data=label_pdf(dict(r),get_settings(c));name=r['tag_no']
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="tag-{name}.pdf"'})
+
+def party_list(table,q=''):
+    with read_db() as c:
+        if q:return rowsdict(c.execute(f'SELECT * FROM {table} WHERE active=1 AND (name LIKE ? OR code LIKE ? OR phone LIKE ?) ORDER BY name LIMIT 500',(f'%{q}%',)*3).fetchall())
+        return rowsdict(c.execute(f'SELECT * FROM {table} WHERE active=1 ORDER BY name LIMIT 500').fetchall())
+def party_add(c,table,seq,prefix,p,u):
+    code=str(p.get('code') or '').strip() or next_sequence(c,seq,prefix,5);now=utcnow()
+    if table=='karigars':cur=c.execute('INSERT INTO karigars(code,name,phone,address,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('address'),p.get('notes'),now,now))
+    else:cur=c.execute(f'INSERT INTO {table}(code,name,phone,email,address,gstin,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('email'),p.get('address'),p.get('gstin'),p.get('notes'),now,now))
+    audit(c,u['id'],'create',table[:-1],cur.lastrowid,{'code':code});return dict(c.execute(f'SELECT * FROM {table} WHERE id=?',(cur.lastrowid,)).fetchone())
+@app.get('/api/customers')
+def customers(q:str='',u=Depends(require('contacts'))):return party_list('customers',q)
+@app.post('/api/customers')
+def customer_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    with write_db() as c:return party_add(c,'customers','customer','C',p,u)
+@app.get('/api/suppliers')
+def suppliers(q:str='',u=Depends(require('contacts'))):return party_list('suppliers',q)
+@app.post('/api/suppliers')
+def supplier_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    with write_db() as c:return party_add(c,'suppliers','supplier','S',p,u)
+@app.get('/api/karigars')
+def karigars(q:str='',u=Depends(require('contacts'))):return party_list('karigars',q)
+@app.post('/api/karigars')
+def karigar_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    with write_db() as c:return party_add(c,'karigars','karigar','K',p,u)
+
+@app.post('/api/sales/quote')
+def sales_quote(p:dict=Body(...),u=Depends(require('sales'))):
+    with read_db() as c:return quote_sale(c,p.get('lines') or [],float(p.get('discount',0) or 0),sum(float(x.get('value',0) or 0) for x in p.get('old_gold') or []))
+@app.post('/api/sales')
+def sale(req:Request,p:dict=Body(...),u=Depends(require('sales'))):
+    with write_db() as c:return post_sale(c,p,u,ip(req))
+@app.get('/api/sales')
+def sales(date_from:str='',date_to:str='',q:str='',limit:int=Query(500,le=2000),u=Depends(require('sales'))):
+    w=[];a=[]
+    if date_from:w.append('substr(s.created_at,1,10)>=?');a.append(date_from)
+    if date_to:w.append('substr(s.created_at,1,10)<=?');a.append(date_to)
+    if q:w.append('(s.invoice_no LIKE ? OR c.name LIKE ? OR c.phone LIKE ?)');a += [f'%{q}%']*3
+    a.append(limit);sql='SELECT s.*,c.name customer_name,c.phone customer_phone,u.full_name user_name FROM sales s LEFT JOIN customers c ON c.id=s.customer_id LEFT JOIN users u ON u.id=s.user_id'+(' WHERE '+' AND '.join(w) if w else '')+' ORDER BY s.id DESC LIMIT ?'
+    with read_db() as c:return rowsdict(c.execute(sql,a).fetchall())
+@app.get('/api/sales/{sid}')
+def sale_detail(sid:int,u=Depends(require('sales'))):
+    with read_db() as c:
+        s=c.execute('SELECT * FROM sales WHERE id=?',(sid,)).fetchone()
+        if not s:raise HTTPException(404,'Sale not found')
+        return {'sale':dict(s),'lines':rowsdict(c.execute('SELECT * FROM sale_items WHERE sale_id=?',(sid,)).fetchall()),'customer':rowdict(c.execute('SELECT * FROM customers WHERE id=?',(s['customer_id'],)).fetchone()) if s['customer_id'] else None,'old_gold':rowsdict(c.execute('SELECT * FROM old_gold WHERE sale_id=?',(sid,)).fetchall())}
+@app.get('/api/sales/{sid}/invoice.pdf')
+def invoice(sid:int,u=Depends(require('sales'))):
+    d=sale_detail(sid,u)
+    with read_db() as c:data=invoice_pdf(d['sale'],d['lines'],d['customer'],get_settings(c),d['old_gold'])
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="{d["sale"]["invoice_no"]}.pdf"'})
+@app.post('/api/sales/{sid}/cancel')
+def sale_cancel(sid:int,req:Request,p:dict=Body(default={}),u=Depends(require('sales'))):
+    if u['role'] not in ('admin','manager'):raise HTTPException(403,'Manager permission required to cancel invoices')
+    with write_db() as c:return cancel_sale(c,sid,u,str(p.get('reason') or 'Cancelled'),ip(req))
+
+@app.post('/api/purchases')
+def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
+    req=str(p.get('client_request_id') or '').strip() or None
+    with write_db() as c:
+        if req:
+            old=c.execute('SELECT id,purchase_no,total FROM purchases WHERE client_request_id=?',(req,)).fetchone()
+            if old:return dict(old)|{'idempotent':True}
+        its=p.get('items') or []
+        if not its:raise HTTPException(400,'Purchase must have at least one item')
+        no=next_sequence(c,'purchase','PUR-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);sub=money(sum(float(x.get('cost_amount',0) or 0) for x in its));gst=money(p.get('gst'));total=money(sub+gst);paid=money(p.get('paid'))
+        if paid<0 or paid>total+.01:raise HTTPException(400,'Paid amount cannot exceed purchase total')
+        cur=c.execute('INSERT INTO purchases(purchase_no,client_request_id,supplier_id,branch_id,subtotal,gst,total,paid,notes,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(no,req,sid,bid,sub,gst,total,paid,p.get('notes'),u['id'],now));pid=cur.lastrowid
+        for x in its:
+            x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u['id']);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount) VALUES(?,?,?,0)',(pid,it['id'],it['cost_amount']))
+        payable=money(total-paid)
+        if sid and payable:c.execute('UPDATE suppliers SET balance=balance+?,updated_at=? WHERE id=?',(payable,now,sid))
+        je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,dt.date.today().isoformat(),f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
+        if gst:lines.append(('2110',gst,0,None,None))
+        if paid:lines.append(('1000',0,paid,None,None))
+        if payable:lines.append(('2000',0,payable,'supplier',sid))
+        for code,dr,cr,pt,party in lines:c.execute('INSERT INTO journal_lines(entry_id,account_code,debit,credit,party_type,party_id) VALUES(?,?,?,?,?,?)',(j,code,dr,cr,pt,party))
+        audit(c,u['id'],'create','purchase',pid,{'purchase_no':no,'total':total});return {'id':pid,'purchase_no':no,'total':total}
+@app.get('/api/purchases')
+def purchases(u=Depends(require('purchases'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT p.*,s.name supplier_name FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.id DESC LIMIT 500').fetchall())
+
+def wf_list(table):
+    with read_db() as c:
+        sql='SELECT r.*,c.name customer_name,k.name karigar_name FROM repairs r LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN karigars k ON k.id=r.karigar_id ORDER BY r.id DESC LIMIT 500' if table=='repairs' else 'SELECT o.*,c.name customer_name,k.name karigar_name FROM orders o LEFT JOIN customers c ON c.id=o.customer_id LEFT JOIN karigars k ON k.id=o.karigar_id ORDER BY o.id DESC LIMIT 500';return rowsdict(c.execute(sql).fetchall())
+@app.get('/api/repairs')
+def repairs(u=Depends(require('repairs'))):return wf_list('repairs')
+@app.post('/api/repairs')
+def repair_add(p:dict=Body(...),u=Depends(require('repairs'))):
+    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),float(p.get('gross_weight',0) or 0),p.get('received_on') or dt.date.today().isoformat(),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
+@app.put('/api/repairs/{rid}')
+def repair_edit(rid:int,p:dict=Body(...),u=Depends(require('repairs'))):
+    with write_db() as c:r=c.execute('SELECT * FROM repairs WHERE id=?',(rid,)).fetchone();
+    if not r:raise HTTPException(404,'Repair not found')
+    with write_db() as c:c.execute('UPDATE repairs SET status=?,karigar_id=?,promised_on=?,estimated_amount=?,advance=?,final_amount=?,notes=?,updated_at=? WHERE id=?',(p.get('status',r['status']),p.get('karigar_id',r['karigar_id']),p.get('promised_on',r['promised_on']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),money(p.get('final_amount',r['final_amount'])),p.get('notes',r['notes']),utcnow(),rid));return {'ok':True}
+@app.get('/api/orders')
+def orders(u=Depends(require('orders'))):return wf_list('orders')
+@app.post('/api/orders')
+def order_add(p:dict=Body(...),u=Depends(require('orders'))):
+    with write_db() as c:no=next_sequence(c,'order','ORD-',6);now=utcnow();cur=c.execute('INSERT INTO orders(order_no,customer_id,description,metal,purity,target_weight,karigar_id,status,estimated_amount,advance,due_date,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('description') or 'Custom jewellery',p.get('metal') or 'Gold',p.get('purity') or '916',float(p.get('target_weight',0) or 0),p.get('karigar_id'),p.get('status') or 'new',money(p.get('estimated_amount')),money(p.get('advance')),p.get('due_date'),p.get('notes'),u['id'],now,now));return {'id':cur.lastrowid,'order_no':no}
+@app.put('/api/orders/{oid}')
+def order_edit(oid:int,p:dict=Body(...),u=Depends(require('orders'))):
+    with read_db() as c:r=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
+    if not r:raise HTTPException(404,'Order not found')
+    with write_db() as c:c.execute('UPDATE orders SET status=?,karigar_id=?,due_date=?,estimated_amount=?,advance=?,notes=?,updated_at=? WHERE id=?',(p.get('status',r['status']),p.get('karigar_id',r['karigar_id']),p.get('due_date',r['due_date']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),p.get('notes',r['notes']),utcnow(),oid));return {'ok':True}
+
+@app.get('/api/karigars/{kid}/ledger')
+def kledger(kid:int,u=Depends(require('contacts'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT * FROM karigar_ledger WHERE karigar_id=? ORDER BY id DESC LIMIT 500',(kid,)).fetchall())
+@app.post('/api/karigars/{kid}/ledger')
+def kledger_add(kid:int,p:dict=Body(...),u=Depends(require('contacts'))):
+    typ=p.get('entry_type') or 'adjustment';wt=weight(p.get('weight'));amt=money(p.get('amount'))
+    with write_db() as c:
+        if not c.execute('SELECT id FROM karigars WHERE id=?',(kid,)).fetchone():raise HTTPException(404,'Karigar not found')
+        cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;c.execute('UPDATE karigars SET metal_balance_grams=metal_balance_grams+?,cash_balance=cash_balance+?,updated_at=? WHERE id=?',(md,cd,utcnow(),kid));return {'id':cur.lastrowid}
+
+@app.get('/api/approvals')
+def approvals(u=Depends(require('approvals'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT a.*,count(ai.id) item_count FROM approvals a LEFT JOIN approval_items ai ON ai.approval_id=a.id GROUP BY a.id ORDER BY a.id DESC LIMIT 500').fetchall())
+@app.post('/api/approvals')
+def approval_add(p:dict=Body(...),u=Depends(require('approvals'))):
+    ids=[int(x) for x in p.get('item_ids') or []]
+    if not ids:raise HTTPException(400,'Select at least one item')
+    with write_db() as c:
+        no=next_sequence(c,'approval','JNG-',6);now=utcnow();aid=c.execute("INSERT INTO approvals(approval_no,party_name,party_phone,issued_at,due_at,status,note,user_id) VALUES(?,?,?,?,?,'open',?,?)",(no,p.get('party_name') or 'Party',p.get('party_phone'),now,p.get('due_at'),p.get('note'),u['id'])).lastrowid
+        for iid in ids:
+            it=c.execute("SELECT * FROM items WHERE id=? AND status='in_stock'",(iid,)).fetchone()
+            if not it:raise HTTPException(409,f'Item {iid} not available')
+            c.execute("UPDATE items SET status='approval',version=version+1,updated_at=? WHERE id=?",(now,iid));c.execute("INSERT INTO approval_items(approval_id,item_id,status) VALUES(?,?,'out')",(aid,iid));c.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(iid,'approval_out','approval',aid,f"branch:{it['branch_id']}",p.get('party_name'),it['gross_weight'],u['id'],no,now))
+        return {'id':aid,'approval_no':no}
+@app.post('/api/approvals/{aid}/return/{iid}')
+def approval_return(aid:int,iid:int,u=Depends(require('approvals'))):
+    with write_db() as c:
+        ai=c.execute("SELECT * FROM approval_items WHERE approval_id=? AND item_id=? AND status='out'",(aid,iid)).fetchone()
+        if not ai:raise HTTPException(409,'Item not outstanding on approval')
+        now=utcnow();c.execute("UPDATE approval_items SET status='returned',returned_at=? WHERE id=?",(now,ai['id']));c.execute("UPDATE items SET status='in_stock',version=version+1,updated_at=? WHERE id=?",(now,iid));n=c.execute("SELECT count(*) FROM approval_items WHERE approval_id=? AND status='out'",(aid,)).fetchone()[0];c.execute('UPDATE approvals SET status=? WHERE id=?',('closed' if n==0 else 'partial',aid));return {'ok':True}
+
+@app.post('/api/stock-audits')
+def audit_start(p:dict=Body(...),u=Depends(require('audit'))):
+    with write_db() as c:no=next_sequence(c,'audit','AUD-',6);cur=c.execute("INSERT INTO stock_audits(audit_no,branch_id,counter_id,status,started_by,started_at) VALUES(?,?,?,'open',?,?)",(no,int(p.get('branch_id') or 1),p.get('counter_id'),u['id'],utcnow()));return {'id':cur.lastrowid,'audit_no':no}
+@app.get('/api/stock-audits')
+def audit_list(u=Depends(require('audit'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT * FROM stock_audits ORDER BY id DESC LIMIT 100').fetchall())
+@app.post('/api/stock-audits/{aid}/scan')
+def audit_scan(aid:int,p:dict=Body(...),u=Depends(require('audit'))):
+    code=str(p.get('barcode') or '').strip()
+    with write_db() as c:
+        if not c.execute("SELECT id FROM stock_audits WHERE id=? AND status='open'",(aid,)).fetchone():raise HTTPException(409,'Audit is not open')
+        it=c.execute('SELECT * FROM items WHERE barcode=? COLLATE NOCASE OR tag_no=? COLLATE NOCASE OR rfid_epc=?',(code,code,code)).fetchone()
+        if not it:raise HTTPException(404,'Tag not found')
+        try:c.execute('INSERT INTO stock_audit_scans(audit_id,item_id,scanned_by,scanned_at) VALUES(?,?,?,?)',(aid,it['id'],u['id'],utcnow()));new=True
+        except:new=False
+        return {'item':dict(it),'new':new}
+def audit_calc(aid):
+    with read_db() as c:
+        a=c.execute('SELECT * FROM stock_audits WHERE id=?',(aid,)).fetchone()
+        if not a:raise HTTPException(404,'Audit not found')
+        params=[a['branch_id']];where="i.status='in_stock' AND i.branch_id=?"
+        if a['counter_id'] is not None:where+=' AND i.counter_id=?';params.append(a['counter_id'])
+        exp=rowsdict(c.execute(f'SELECT i.* FROM items i WHERE {where} ORDER BY i.tag_no',params).fetchall());scan=rowsdict(c.execute('SELECT i.* FROM stock_audit_scans s JOIN items i ON i.id=s.item_id WHERE s.audit_id=? ORDER BY s.id',(aid,)).fetchall());ei={x['id'] for x in exp};si={x['id'] for x in scan};return {'audit':dict(a),'expected_count':len(exp),'scanned_count':len(scan),'missing':[x for x in exp if x['id'] not in si],'extra':[x for x in scan if x['id'] not in ei]}
+@app.get('/api/stock-audits/{aid}/result')
+def audit_result(aid:int,u=Depends(require('audit'))):return audit_calc(aid)
+@app.post('/api/stock-audits/{aid}/close')
+def audit_close(aid:int,u=Depends(require('audit'))):
+    with write_db() as c:c.execute("UPDATE stock_audits SET status='closed',closed_at=? WHERE id=?",(utcnow(),aid))
+    return audit_calc(aid)
+
+@app.get('/api/reports/summary')
+def summary(date_from:str='',date_to:str='',u=Depends(require('reports'))):
+    date_from=date_from or dt.date.today().replace(day=1).isoformat();date_to=date_to or dt.date.today().isoformat()
+    with read_db() as c:s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable),0) taxable,coalesce(sum(gst),0) gst,coalesce(sum(total),0) total FROM sales WHERE status='posted' AND substr(created_at,1,10) BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_weight),0) gross_weight,coalesce(sum(net_weight),0) net_weight,coalesce(sum(cost_amount),0) cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_weight) gross_weight,sum(net_weight) net_weight,sum(cost_amount) cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash),0) cash,coalesce(sum(payment_card),0) card,coalesce(sum(payment_upi),0) upi,coalesce(sum(payment_credit),0) credit,coalesce(sum(old_gold_value),0) old_gold FROM sales WHERE status='posted' AND substr(created_at,1,10) BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
+@app.get('/api/reports/trial-balance')
+def trial(date_to:str='',u=Depends(require('reports'))):
+    date_to=date_to or dt.date.today().isoformat()
+    with read_db() as c:return rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit),0) debit,coalesce(sum(x.credit),0) credit,coalesce(sum(x.debit-x.credit),0) balance FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code,a.name,a.account_type ORDER BY a.code",(date_to,)).fetchall())
+@app.get('/api/reports/ledger/{code}')
+def ledger(code:str,date_from:str='',date_to:str='',u=Depends(require('reports'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT je.entry_no,je.entry_date,je.memo,je.ref_type,je.ref_id,jl.debit,jl.credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE jl.account_code=? AND je.entry_date BETWEEN ? AND ? ORDER BY je.entry_date,je.id',(code,date_from or '0001-01-01',date_to or '9999-12-31')).fetchall())
+@app.get('/api/reports/stock.pdf')
+def stock_pdf(u=Depends(require('reports'))):
+    with read_db() as c:data=stock_report_pdf(rowsdict(c.execute("SELECT * FROM items WHERE status='in_stock' ORDER BY category,tag_no").fetchall()),get_settings(c))
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':'inline; filename="stock-report.pdf"'})
+@app.get('/api/backups')
+def backups(u=Depends(require('backup'))):return list_backups()
+@app.post('/api/backups')
+def backup(p:dict=Body(default={}),u=Depends(require('backup'))):
+    f=create_backup(str(p.get('label') or 'manual'));return {'ok':True,'name':f.name,'size':f.stat().st_size}
+@app.get('/api/audit-log')
+def logs(limit:int=Query(200,le=1000),u=Depends(require('*'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT l.*,u.username FROM audit_log l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT ?',(limit,)).fetchall())
+
+def lan_addresses(port):
+    try:return sorted({f'http://{x}:{port}' for x in socket.gethostbyname_ex(socket.gethostname())[2] if not x.startswith('127.')})
+    except:return []
+def cli():
+    p=argparse.ArgumentParser(description='JewelLAN offline jewellery ERP server');p.add_argument('--host',default=os.environ.get('JEWELLAN_HOST','0.0.0.0'));p.add_argument('--port',type=int,default=int(os.environ.get('JEWELLAN_PORT','8765')));p.add_argument('--restore');a=p.parse_args()
+    if a.restore:init_db(hash_password);restore_backup(a.restore);print('Backup restored.');return
+    os.environ['JEWELLAN_PORT']=str(a.port);print('\nJewelLAN Server - OFFLINE LAN MODE');print('Local:',f'http://127.0.0.1:{a.port}');[print('LAN:  ',x) for x in lan_addresses(a.port)];print('Default first login: admin / Jewel@123 (change it immediately)\n');uvicorn.run(app,host=a.host,port=a.port,log_level='info',access_log=False)
+if __name__=='__main__':cli()
