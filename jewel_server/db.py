@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
 PRODUCTION_HARDENED_V1 = True
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def app_data_dir() -> Path:
@@ -37,6 +37,20 @@ DB_PATH = database_path()
 _WRITE_LOCK = threading.RLock()
 
 def utcnow() -> str: return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def business_now(conn) -> dt.datetime:
+    row = conn.execute("SELECT value FROM settings WHERE key='business_timezone_offset_minutes'").fetchone()
+    try:
+        offset = int(str(row[0] if row else "330").strip())
+    except (TypeError, ValueError):
+        offset = 330
+    offset = max(-720, min(840, offset))
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=offset)
+
+
+def business_date(conn) -> str:
+    return business_now(conn).date().isoformat()
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None, check_same_thread=False)
@@ -197,8 +211,169 @@ def _migration_3(conn) -> None:
         conn.execute(statement)
 
 
-MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3))
+def _migration_4(conn) -> None:
+    # Canonical integer mirrors make paise/milligram values exact while the
+    # legacy REAL fields remain for compatibility with the v1 API and PDFs.
+    column_specs = {
+        "items": {
+            "gross_mg": "INTEGER", "stone_mg": "INTEGER", "net_mg": "INTEGER", "fine_mg": "INTEGER",
+            "stone_value_paise": "INTEGER", "cost_amount_paise": "INTEGER",
+        },
+        "metal_rates": {"rate_paise_per_gram": "INTEGER"},
+        "sales": {
+            "business_date": "TEXT", "subtotal_paise": "INTEGER", "discount_paise": "INTEGER",
+            "taxable_paise": "INTEGER", "gst_paise": "INTEGER", "cgst_paise": "INTEGER",
+            "sgst_paise": "INTEGER", "igst_paise": "INTEGER", "round_off_paise": "INTEGER",
+            "total_paise": "INTEGER", "payment_cash_paise": "INTEGER", "payment_card_paise": "INTEGER",
+            "payment_upi_paise": "INTEGER", "payment_credit_paise": "INTEGER", "old_gold_value_paise": "INTEGER",
+        },
+        "sale_items": {
+            "gross_mg": "INTEGER", "net_mg": "INTEGER", "metal_rate_paise": "INTEGER",
+            "metal_value_paise": "INTEGER", "wastage_value_paise": "INTEGER", "making_charge_paise": "INTEGER",
+            "stone_value_paise": "INTEGER", "discount_paise": "INTEGER", "taxable_paise": "INTEGER",
+            "gst_amount_paise": "INTEGER", "line_total_paise": "INTEGER", "cost_amount_paise": "INTEGER",
+        },
+        "old_gold": {
+            "gross_mg": "INTEGER", "net_mg": "INTEGER", "pure_mg": "INTEGER",
+            "rate_paise": "INTEGER", "value_paise": "INTEGER",
+        },
+        "purchases": {
+            "business_date": "TEXT", "subtotal_paise": "INTEGER", "gst_paise": "INTEGER",
+            "total_paise": "INTEGER", "paid_paise": "INTEGER",
+        },
+        "purchase_items": {"cost_amount_paise": "INTEGER", "gst_amount_paise": "INTEGER"},
+        "journal_lines": {"debit_paise": "INTEGER", "credit_paise": "INTEGER"},
+    }
+    for table, specs in column_specs.items():
+        for name, spec in specs.items():
+            _add_column_if_missing(conn, table, name, spec)
 
+    # Full UPDATE immutability triggers need to be temporarily removed only
+    # while existing rows receive their canonical mirrors in this transaction.
+    for trigger in (
+        "sale_items_no_update", "old_gold_no_update", "purchases_no_update", "journal_lines_no_update"
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+    conn.execute("""UPDATE items SET
+        gross_mg=CAST(ROUND(gross_weight*1000) AS INTEGER),
+        stone_mg=CAST(ROUND(stone_weight*1000) AS INTEGER),
+        net_mg=CAST(ROUND(net_weight*1000) AS INTEGER),
+        fine_mg=CAST(ROUND(fine_weight*1000) AS INTEGER),
+        stone_value_paise=CAST(ROUND(stone_value*100) AS INTEGER),
+        cost_amount_paise=CAST(ROUND(cost_amount*100) AS INTEGER)""")
+    conn.execute("UPDATE metal_rates SET rate_paise_per_gram=CAST(ROUND(rate_per_gram*100) AS INTEGER)")
+    conn.execute("""UPDATE sales SET
+        business_date=coalesce(business_date,substr(created_at,1,10)),
+        subtotal_paise=CAST(ROUND(subtotal*100) AS INTEGER),discount_paise=CAST(ROUND(discount*100) AS INTEGER),
+        taxable_paise=CAST(ROUND(taxable*100) AS INTEGER),gst_paise=CAST(ROUND(gst*100) AS INTEGER),
+        cgst_paise=CAST(ROUND(cgst*100) AS INTEGER),sgst_paise=CAST(ROUND(sgst*100) AS INTEGER),
+        igst_paise=CAST(ROUND(igst*100) AS INTEGER),round_off_paise=CAST(ROUND(round_off*100) AS INTEGER),
+        total_paise=CAST(ROUND(total*100) AS INTEGER),payment_cash_paise=CAST(ROUND(payment_cash*100) AS INTEGER),
+        payment_card_paise=CAST(ROUND(payment_card*100) AS INTEGER),payment_upi_paise=CAST(ROUND(payment_upi*100) AS INTEGER),
+        payment_credit_paise=CAST(ROUND(payment_credit*100) AS INTEGER),old_gold_value_paise=CAST(ROUND(old_gold_value*100) AS INTEGER)""")
+    conn.execute("""UPDATE sale_items SET
+        gross_mg=CAST(ROUND(gross_weight*1000) AS INTEGER),net_mg=CAST(ROUND(net_weight*1000) AS INTEGER),
+        metal_rate_paise=CAST(ROUND(metal_rate*100) AS INTEGER),metal_value_paise=CAST(ROUND(metal_value*100) AS INTEGER),
+        wastage_value_paise=CAST(ROUND(wastage_value*100) AS INTEGER),making_charge_paise=CAST(ROUND(making_charge*100) AS INTEGER),
+        stone_value_paise=CAST(ROUND(stone_value*100) AS INTEGER),discount_paise=CAST(ROUND(discount*100) AS INTEGER),
+        taxable_paise=CAST(ROUND(taxable*100) AS INTEGER),gst_amount_paise=CAST(ROUND(gst_amount*100) AS INTEGER),
+        line_total_paise=CAST(ROUND(line_total*100) AS INTEGER),cost_amount_paise=CAST(ROUND(cost_amount*100) AS INTEGER)""")
+    conn.execute("""UPDATE old_gold SET gross_mg=CAST(ROUND(gross_weight*1000) AS INTEGER),
+        net_mg=CAST(ROUND(net_weight*1000) AS INTEGER),pure_mg=CAST(ROUND(pure_weight*1000) AS INTEGER),
+        rate_paise=CAST(ROUND(rate*100) AS INTEGER),value_paise=CAST(ROUND(value*100) AS INTEGER)""")
+    conn.execute("""UPDATE purchases SET business_date=coalesce(business_date,substr(created_at,1,10)),
+        subtotal_paise=CAST(ROUND(subtotal*100) AS INTEGER),gst_paise=CAST(ROUND(gst*100) AS INTEGER),
+        total_paise=CAST(ROUND(total*100) AS INTEGER),paid_paise=CAST(ROUND(paid*100) AS INTEGER)""")
+    conn.execute("UPDATE purchase_items SET cost_amount_paise=CAST(ROUND(cost_amount*100) AS INTEGER),gst_amount_paise=CAST(ROUND(gst_amount*100) AS INTEGER)")
+    conn.execute("UPDATE journal_lines SET debit_paise=CAST(ROUND(debit*100) AS INTEGER),credit_paise=CAST(ROUND(credit*100) AS INTEGER)")
+
+    # Recreate v3 update guards, then add v4 canonical guards.
+    _migration_3(conn)
+    statements = [
+        "CREATE TRIGGER IF NOT EXISTS purchase_items_no_update BEFORE UPDATE ON purchase_items BEGIN SELECT RAISE(ABORT,'posted purchase lines are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS purchase_items_no_delete BEFORE DELETE ON purchase_items BEGIN SELECT RAISE(ABORT,'posted purchase lines are immutable'); END",
+        """CREATE TRIGGER IF NOT EXISTS canonical_items_insert BEFORE INSERT ON items WHEN
+        NEW.gross_mg IS NULL OR NEW.gross_mg!=CAST(ROUND(NEW.gross_weight*1000) AS INTEGER) OR
+        NEW.stone_mg IS NULL OR NEW.stone_mg!=CAST(ROUND(NEW.stone_weight*1000) AS INTEGER) OR
+        NEW.net_mg IS NULL OR NEW.net_mg!=CAST(ROUND(NEW.net_weight*1000) AS INTEGER) OR
+        NEW.fine_mg IS NULL OR NEW.fine_mg!=CAST(ROUND(NEW.fine_weight*1000) AS INTEGER) OR
+        NEW.stone_value_paise IS NULL OR NEW.stone_value_paise!=CAST(ROUND(NEW.stone_value*100) AS INTEGER) OR
+        NEW.cost_amount_paise IS NULL OR NEW.cost_amount_paise!=CAST(ROUND(NEW.cost_amount*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'item canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_items_update BEFORE UPDATE OF gross_weight,stone_weight,net_weight,fine_weight,stone_value,cost_amount,gross_mg,stone_mg,net_mg,fine_mg,stone_value_paise,cost_amount_paise ON items WHEN
+        NEW.gross_mg IS NULL OR NEW.gross_mg!=CAST(ROUND(NEW.gross_weight*1000) AS INTEGER) OR
+        NEW.stone_mg IS NULL OR NEW.stone_mg!=CAST(ROUND(NEW.stone_weight*1000) AS INTEGER) OR
+        NEW.net_mg IS NULL OR NEW.net_mg!=CAST(ROUND(NEW.net_weight*1000) AS INTEGER) OR
+        NEW.fine_mg IS NULL OR NEW.fine_mg!=CAST(ROUND(NEW.fine_weight*1000) AS INTEGER) OR
+        NEW.stone_value_paise IS NULL OR NEW.stone_value_paise!=CAST(ROUND(NEW.stone_value*100) AS INTEGER) OR
+        NEW.cost_amount_paise IS NULL OR NEW.cost_amount_paise!=CAST(ROUND(NEW.cost_amount*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'item canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_rate_insert BEFORE INSERT ON metal_rates WHEN
+        NEW.rate_paise_per_gram IS NULL OR NEW.rate_paise_per_gram!=CAST(ROUND(NEW.rate_per_gram*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'metal-rate canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_sales_insert BEFORE INSERT ON sales WHEN
+        NEW.business_date IS NULL OR length(NEW.business_date)!=10 OR
+        NEW.subtotal_paise IS NULL OR NEW.subtotal_paise!=CAST(ROUND(NEW.subtotal*100) AS INTEGER) OR
+        NEW.discount_paise IS NULL OR NEW.discount_paise!=CAST(ROUND(NEW.discount*100) AS INTEGER) OR
+        NEW.taxable_paise IS NULL OR NEW.taxable_paise!=CAST(ROUND(NEW.taxable*100) AS INTEGER) OR
+        NEW.gst_paise IS NULL OR NEW.gst_paise!=CAST(ROUND(NEW.gst*100) AS INTEGER) OR
+        NEW.cgst_paise IS NULL OR NEW.cgst_paise!=CAST(ROUND(NEW.cgst*100) AS INTEGER) OR
+        NEW.sgst_paise IS NULL OR NEW.sgst_paise!=CAST(ROUND(NEW.sgst*100) AS INTEGER) OR
+        NEW.igst_paise IS NULL OR NEW.igst_paise!=CAST(ROUND(NEW.igst*100) AS INTEGER) OR
+        NEW.round_off_paise IS NULL OR NEW.round_off_paise!=CAST(ROUND(NEW.round_off*100) AS INTEGER) OR
+        NEW.total_paise IS NULL OR NEW.total_paise!=CAST(ROUND(NEW.total*100) AS INTEGER) OR
+        NEW.payment_cash_paise IS NULL OR NEW.payment_cash_paise!=CAST(ROUND(NEW.payment_cash*100) AS INTEGER) OR
+        NEW.payment_card_paise IS NULL OR NEW.payment_card_paise!=CAST(ROUND(NEW.payment_card*100) AS INTEGER) OR
+        NEW.payment_upi_paise IS NULL OR NEW.payment_upi_paise!=CAST(ROUND(NEW.payment_upi*100) AS INTEGER) OR
+        NEW.payment_credit_paise IS NULL OR NEW.payment_credit_paise!=CAST(ROUND(NEW.payment_credit*100) AS INTEGER) OR
+        NEW.old_gold_value_paise IS NULL OR NEW.old_gold_value_paise!=CAST(ROUND(NEW.old_gold_value*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'sale canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_sale_items_insert BEFORE INSERT ON sale_items WHEN
+        NEW.gross_mg IS NULL OR NEW.gross_mg!=CAST(ROUND(NEW.gross_weight*1000) AS INTEGER) OR
+        NEW.net_mg IS NULL OR NEW.net_mg!=CAST(ROUND(NEW.net_weight*1000) AS INTEGER) OR
+        NEW.metal_rate_paise IS NULL OR NEW.metal_rate_paise!=CAST(ROUND(NEW.metal_rate*100) AS INTEGER) OR
+        NEW.metal_value_paise IS NULL OR NEW.metal_value_paise!=CAST(ROUND(NEW.metal_value*100) AS INTEGER) OR
+        NEW.wastage_value_paise IS NULL OR NEW.wastage_value_paise!=CAST(ROUND(NEW.wastage_value*100) AS INTEGER) OR
+        NEW.making_charge_paise IS NULL OR NEW.making_charge_paise!=CAST(ROUND(NEW.making_charge*100) AS INTEGER) OR
+        NEW.stone_value_paise IS NULL OR NEW.stone_value_paise!=CAST(ROUND(NEW.stone_value*100) AS INTEGER) OR
+        NEW.discount_paise IS NULL OR NEW.discount_paise!=CAST(ROUND(NEW.discount*100) AS INTEGER) OR
+        NEW.taxable_paise IS NULL OR NEW.taxable_paise!=CAST(ROUND(NEW.taxable*100) AS INTEGER) OR
+        NEW.gst_amount_paise IS NULL OR NEW.gst_amount_paise!=CAST(ROUND(NEW.gst_amount*100) AS INTEGER) OR
+        NEW.line_total_paise IS NULL OR NEW.line_total_paise!=CAST(ROUND(NEW.line_total*100) AS INTEGER) OR
+        NEW.cost_amount_paise IS NULL OR NEW.cost_amount_paise!=CAST(ROUND(NEW.cost_amount*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'sale-line canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_old_gold_insert BEFORE INSERT ON old_gold WHEN
+        NEW.gross_mg IS NULL OR NEW.gross_mg!=CAST(ROUND(NEW.gross_weight*1000) AS INTEGER) OR
+        NEW.net_mg IS NULL OR NEW.net_mg!=CAST(ROUND(NEW.net_weight*1000) AS INTEGER) OR
+        NEW.pure_mg IS NULL OR NEW.pure_mg!=CAST(ROUND(NEW.pure_weight*1000) AS INTEGER) OR
+        NEW.rate_paise IS NULL OR NEW.rate_paise!=CAST(ROUND(NEW.rate*100) AS INTEGER) OR
+        NEW.value_paise IS NULL OR NEW.value_paise!=CAST(ROUND(NEW.value*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'old-gold canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_purchases_insert BEFORE INSERT ON purchases WHEN
+        NEW.business_date IS NULL OR length(NEW.business_date)!=10 OR
+        NEW.subtotal_paise IS NULL OR NEW.subtotal_paise!=CAST(ROUND(NEW.subtotal*100) AS INTEGER) OR
+        NEW.gst_paise IS NULL OR NEW.gst_paise!=CAST(ROUND(NEW.gst*100) AS INTEGER) OR
+        NEW.total_paise IS NULL OR NEW.total_paise!=CAST(ROUND(NEW.total*100) AS INTEGER) OR
+        NEW.paid_paise IS NULL OR NEW.paid_paise!=CAST(ROUND(NEW.paid*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'purchase canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_purchase_items_insert BEFORE INSERT ON purchase_items WHEN
+        NEW.cost_amount_paise IS NULL OR NEW.cost_amount_paise!=CAST(ROUND(NEW.cost_amount*100) AS INTEGER) OR
+        NEW.gst_amount_paise IS NULL OR NEW.gst_amount_paise!=CAST(ROUND(NEW.gst_amount*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'purchase-line canonical mirror mismatch'); END""",
+        """CREATE TRIGGER IF NOT EXISTS canonical_journal_lines_insert BEFORE INSERT ON journal_lines WHEN
+        NEW.debit_paise IS NULL OR NEW.debit_paise!=CAST(ROUND(NEW.debit*100) AS INTEGER) OR
+        NEW.credit_paise IS NULL OR NEW.credit_paise!=CAST(ROUND(NEW.credit*100) AS INTEGER)
+        BEGIN SELECT RAISE(ABORT,'journal-line canonical mirror mismatch'); END""",
+    ]
+    conn.execute("DROP TRIGGER IF EXISTS sales_financial_no_update")
+    conn.execute("""CREATE TRIGGER sales_financial_no_update BEFORE UPDATE OF invoice_no,client_request_id,branch_id,counter_id,customer_id,business_date,subtotal,discount,taxable,gst,place_of_supply_code,cgst,sgst,igst,round_off,total,payment_cash,payment_card,payment_upi,payment_credit,old_gold_value,subtotal_paise,discount_paise,taxable_paise,gst_paise,cgst_paise,sgst_paise,igst_paise,round_off_paise,total_paise,payment_cash_paise,payment_card_paise,payment_upi_paise,payment_credit_paise,old_gold_value_paise,user_id,created_at ON sales
+    BEGIN SELECT RAISE(ABORT,'posted invoice financial fields are immutable; cancel/reverse instead'); END""")
+    for statement in statements:
+        conn.execute(statement)
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4))
 
 def _migrate_schema(conn) -> None:
     applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
@@ -234,7 +409,7 @@ def init_db(password_hasher)->None:
         conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
         for code,name,typ in DEFAULT_ACCOUNTS: conn.execute("INSERT OR IGNORE INTO accounts(code,name,account_type,active) VALUES(?,?,?,1)",(code,name,typ))
         for key,name in TALLY_DEFAULT_MAPPINGS.items(): conn.execute("INSERT OR IGNORE INTO tally_ledger_mappings(mapping_key,tally_ledger_name,updated_at) VALUES(?,?,?)",(key,name,now))
-        defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
+        defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","business_timezone_offset_minutes":"330","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
         for k,v in defaults.items(): conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(k,v,now))
         if not conn.execute("SELECT id FROM users WHERE username='admin'").fetchone(): conn.execute("INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",("admin",password_hasher("Jewel@123"),"Administrator","admin",now,now))
         for seq in ("invoice","purchase","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))

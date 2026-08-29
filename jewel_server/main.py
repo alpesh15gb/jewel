@@ -6,17 +6,17 @@ import uvicorn
 from fastapi import Body,Depends,FastAPI,HTTPException,Query,Request
 from fastapi.responses import Response
 from .backup import BackupWorker,backup_status,create_backup,list_backups,restore_backup,verify_backup
-from .db import audit,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
+from .db import audit,business_date,business_now,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
 from .discovery import DiscoveryResponder
 from .pdfs import invoice_pdf,label_pdf,stock_report_pdf
 from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
 from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
 from .integrity import database_integrity,day_close
-from .precision import money_sum
+from .precision import money_paise,money_sum
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
 
 PRODUCTION_HARDENED_V1 = True
-APP_VERSION='1.1.0-rc1'
+APP_VERSION='1.2.0-rc1'
 backup_worker=None;discovery=None;tally_worker=None
 @asynccontextmanager
 async def lifespan(app):
@@ -72,16 +72,16 @@ def change_password(p:dict=Body(...),u=Depends(current_user)):
 
 @app.get('/api/dashboard')
 def dashboard(u=Depends(require('dashboard'))):
-    today=dt.date.today().isoformat()
     with read_db() as c:
-        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_weight),0) gw,coalesce(sum(net_weight),0) nw,coalesce(sum(cost_amount),0) cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total),0) total FROM sales WHERE status='posted' AND substr(created_at,1,10)=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
-    return {'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
+        today=business_date(c)
+        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_mg),0)/1000.0 gw,coalesce(sum(net_mg),0)/1000.0 nw,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
+    return {'business_date':today,'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
 @app.get('/api/settings')
 def settings(u=Depends(current_user)):
     with read_db() as c:return {'settings':get_settings(c),'branches':rowsdict(c.execute('SELECT * FROM branches WHERE active=1 ORDER BY name').fetchall()),'counters':rowsdict(c.execute('SELECT * FROM counters WHERE active=1 ORDER BY branch_id,name').fetchall())}
 @app.put('/api/settings')
 def save_settings(p:dict=Body(...),u=Depends(require('*'))):
-    allowed={'business_name','business_address','business_phone','business_gstin','business_state_code','currency','invoice_prefix','tag_prefix','gst_default','label_width_mm','label_height_mm','backup_interval_hours','backup_retention_days','tally_enabled','tally_bridge_url','tally_bridge_token','tally_company','tally_auto_create_parties'}
+    allowed={'business_name','business_address','business_phone','business_gstin','business_state_code','business_timezone_offset_minutes','currency','invoice_prefix','tag_prefix','gst_default','label_width_mm','label_height_mm','backup_interval_hours','backup_retention_days','tally_enabled','tally_bridge_url','tally_bridge_token','tally_company','tally_auto_create_parties'}
     with write_db() as c:
         for k,v in p.items():
             if k in allowed:set_setting(c,k,str(v))
@@ -126,7 +126,7 @@ def rates(u=Depends(current_user)):
 def add_rate(p:dict=Body(...),u=Depends(require('rates'))):
     rate=money(p.get('rate_per_gram'))
     if rate<=0:raise HTTPException(400,'Rate must be positive')
-    with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by) VALUES(?,?,?,?,?)',(p.get('metal') or 'Gold',p.get('purity') or '916',rate,p.get('effective_at') or utcnow(),u['id']));audit(c,u['id'],'create','metal_rate',cur.lastrowid,p);return {'id':cur.lastrowid}
+    with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by,rate_paise_per_gram) VALUES(?,?,?,?,?,?)',(p.get('metal') or 'Gold',p.get('purity') or '916',rate,p.get('effective_at') or utcnow(),u['id'],money_paise(rate)));audit(c,u['id'],'create','metal_rate',cur.lastrowid,p);return {'id':cur.lastrowid}
 
 @app.get('/api/items')
 def items(q:str='',status:str='',branch_id:int|None=None,category:str='',limit:int=Query(500,le=2000),u=Depends(require('inventory.read'))):
@@ -203,8 +203,8 @@ def sale(req:Request,p:dict=Body(...),u=Depends(require('sales'))):
 @app.get('/api/sales')
 def sales(date_from:str='',date_to:str='',q:str='',limit:int=Query(500,le=2000),u=Depends(require('sales'))):
     w=[];a=[]
-    if date_from:w.append('substr(s.created_at,1,10)>=?');a.append(date_from)
-    if date_to:w.append('substr(s.created_at,1,10)<=?');a.append(date_to)
+    if date_from:w.append('s.business_date>=?');a.append(date_from)
+    if date_to:w.append('s.business_date<=?');a.append(date_to)
     if q:w.append('(s.invoice_no LIKE ? OR c.name LIKE ? OR c.phone LIKE ?)');a += [f'%{q}%']*3
     a.append(limit);sql='SELECT s.*,c.name customer_name,c.phone customer_phone,u.full_name user_name FROM sales s LEFT JOIN customers c ON c.id=s.customer_id LEFT JOIN users u ON u.id=s.user_id'+(' WHERE '+' AND '.join(w) if w else '')+' ORDER BY s.id DESC LIMIT ?'
     with read_db() as c:return rowsdict(c.execute(sql,a).fetchall())
@@ -233,19 +233,20 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
             if old:return dict(old)|{'idempotent':True}
         its=p.get('items') or []
         if not its:raise HTTPException(400,'Purchase must have at least one item')
-        no=next_sequence(c,'purchase','PUR-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);sub=money_sum(x.get('cost_amount',0) for x in its);gst=money(p.get('gst'));total=money(sub+gst);paid=money(p.get('paid'))
-        if paid<0 or paid>total+.01:raise HTTPException(400,'Paid amount cannot exceed purchase total')
-        cur=c.execute('INSERT INTO purchases(purchase_no,client_request_id,supplier_id,branch_id,subtotal,gst,total,paid,notes,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(no,req,sid,bid,sub,gst,total,paid,p.get('notes'),u['id'],now));pid=cur.lastrowid
+        no=next_sequence(c,'purchase','PUR-'+business_now(c).strftime('%y%m')+'-',6);now=utcnow();business_day=business_date(c);sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);sub=money_sum(x.get('cost_amount',0) for x in its);gst=money(p.get('gst'));total=money(sub+gst);paid=money(p.get('paid'))
+        if paid<0 or money_paise(paid)>money_paise(total):raise HTTPException(400,'Paid amount cannot exceed purchase total')
+        cur=c.execute('INSERT INTO purchases(purchase_no,client_request_id,supplier_id,branch_id,business_date,subtotal,gst,total,paid,notes,user_id,created_at,subtotal_paise,gst_paise,total_paise,paid_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,req,sid,bid,business_day,sub,gst,total,paid,p.get('notes'),u['id'],now,money_paise(sub),money_paise(gst),money_paise(total),money_paise(paid)));pid=cur.lastrowid
         for x in its:
-            x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount) VALUES(?,?,?,0)',(pid,it['id'],it['cost_amount']))
+            x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount,cost_amount_paise,gst_amount_paise) VALUES(?,?,?,0,?,0)',(pid,it['id'],it['cost_amount'],money_paise(it['cost_amount'])))
         payable=money(total-paid)
         if sid and payable:c.execute('UPDATE suppliers SET balance=balance+?,updated_at=? WHERE id=?',(payable,now,sid))
-        je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,dt.date.today().isoformat(),f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
+        je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,business_day,f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
         if gst:lines.append(('2110',gst,0,None,None))
         if paid:lines.append(('1000',0,paid,None,None))
         if payable:lines.append(('2000',0,payable,'supplier',sid))
-        for code,dr,cr,pt,party in lines:c.execute('INSERT INTO journal_lines(entry_id,account_code,debit,credit,party_type,party_id) VALUES(?,?,?,?,?,?)',(j,code,dr,cr,pt,party))
+        for code,dr,cr,pt,party in lines:c.execute('INSERT INTO journal_lines(entry_id,account_code,debit,credit,party_type,party_id,debit_paise,credit_paise) VALUES(?,?,?,?,?,?,?,?)',(j,code,dr,cr,pt,party,money_paise(dr),money_paise(cr)))
         audit(c,u['id'],'create','purchase',pid,{'purchase_no':no,'total':total});enqueue_tally(c,'purchase',pid,'create');return {'id':pid,'purchase_no':no,'total':total}
+
 @app.get('/api/purchases')
 def purchases(u=Depends(require('purchases'))):
     with read_db() as c:return rowsdict(c.execute('SELECT p.*,s.name supplier_name FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.id DESC LIMIT 500').fetchall())
@@ -257,7 +258,7 @@ def wf_list(table):
 def repairs(u=Depends(require('repairs'))):return wf_list('repairs')
 @app.post('/api/repairs')
 def repair_add(p:dict=Body(...),u=Depends(require('repairs'))):
-    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),weight(p.get('gross_weight',0)),p.get('received_on') or dt.date.today().isoformat(),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
+    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),weight(p.get('gross_weight',0)),p.get('received_on') or business_date(c),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
 @app.put('/api/repairs/{rid}')
 def repair_edit(rid:int,p:dict=Body(...),u=Depends(require('repairs'))):
     with write_db() as c:r=c.execute('SELECT * FROM repairs WHERE id=?',(rid,)).fetchone();
@@ -389,19 +390,20 @@ def tally_retry(qid:int,u=Depends(require('reports'))):
     return {'ok':True}
 @app.get('/api/tally/reconcile')
 def tally_reconcile(date_from:str='',date_to:str='',u=Depends(require('reports'))):
-    date_from=date_from or dt.date.today().replace(day=1).isoformat();date_to=date_to or dt.date.today().isoformat();return reconcile(date_from,date_to)
+    with read_db() as c:today=business_date(c)
+    date_from=date_from or today[:8]+'01';date_to=date_to or today;return reconcile(date_from,date_to)
 
 @app.get('/api/reports/summary')
 def summary(date_from:str='',date_to:str='',u=Depends(require('reports'))):
-    date_from=date_from or dt.date.today().replace(day=1).isoformat();date_to=date_to or dt.date.today().isoformat()
-    with read_db() as c:s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable),0) taxable,coalesce(sum(gst),0) gst,coalesce(sum(total),0) total FROM sales WHERE status='posted' AND substr(created_at,1,10) BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_weight),0) gross_weight,coalesce(sum(net_weight),0) net_weight,coalesce(sum(cost_amount),0) cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_weight) gross_weight,sum(net_weight) net_weight,sum(cost_amount) cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash),0) cash,coalesce(sum(payment_card),0) card,coalesce(sum(payment_upi),0) upi,coalesce(sum(payment_credit),0) credit,coalesce(sum(old_gold_value),0) old_gold FROM sales WHERE status='posted' AND substr(created_at,1,10) BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
+    with read_db() as c:
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today;s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable_paise),0)/100.0 taxable,coalesce(sum(gst_paise),0)/100.0 gst,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_mg),0)/1000.0 gross_weight,coalesce(sum(net_mg),0)/1000.0 net_weight,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_mg)/1000.0 gross_weight,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash_paise),0)/100.0 cash,coalesce(sum(payment_card_paise),0)/100.0 card,coalesce(sum(payment_upi_paise),0)/100.0 upi,coalesce(sum(payment_credit_paise),0)/100.0 credit,coalesce(sum(old_gold_value_paise),0)/100.0 old_gold FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
 @app.get('/api/reports/trial-balance')
 def trial(date_to:str='',u=Depends(require('reports'))):
-    date_to=date_to or dt.date.today().isoformat()
-    with read_db() as c:return rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit),0) debit,coalesce(sum(x.credit),0) credit,coalesce(sum(x.debit-x.credit),0) balance FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code,a.name,a.account_type ORDER BY a.code",(date_to,)).fetchall())
+    with read_db() as c:
+        date_to=date_to or business_date(c);return rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit_paise),0)/100.0 debit,coalesce(sum(x.credit_paise),0)/100.0 credit,coalesce(sum(x.debit_paise-x.credit_paise),0)/100.0 balance FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code,a.name,a.account_type ORDER BY a.code",(date_to,)).fetchall())
 @app.get('/api/reports/ledger/{code}')
 def ledger(code:str,date_from:str='',date_to:str='',u=Depends(require('reports'))):
-    with read_db() as c:return rowsdict(c.execute('SELECT je.entry_no,je.entry_date,je.memo,je.ref_type,je.ref_id,jl.debit,jl.credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE jl.account_code=? AND je.entry_date BETWEEN ? AND ? ORDER BY je.entry_date,je.id',(code,date_from or '0001-01-01',date_to or '9999-12-31')).fetchall())
+    with read_db() as c:return rowsdict(c.execute('SELECT je.entry_no,je.entry_date,je.memo,je.ref_type,je.ref_id,jl.debit_paise/100.0 debit,jl.credit_paise/100.0 credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE jl.account_code=? AND je.entry_date BETWEEN ? AND ? ORDER BY je.entry_date,je.id',(code,date_from or '0001-01-01',date_to or '9999-12-31')).fetchall())
 @app.get('/api/reports/stock.pdf')
 def stock_pdf(u=Depends(require('reports'))):
     with read_db() as c:data=stock_report_pdf(rowsdict(c.execute("SELECT * FROM items WHERE status='in_stock' ORDER BY category,tag_no").fetchall()),get_settings(c))
@@ -413,10 +415,11 @@ def integrity_report(u=Depends(require('reports'))):
 
 @app.get('/api/reports/day-close')
 def day_close_report(date:str='',u=Depends(require('reports'))):
-    business_date=date or dt.date.today().isoformat()
-    try:dt.date.fromisoformat(business_date)
-    except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
-    with read_db() as c:return day_close(c,business_date)
+    with read_db() as c:
+        report_date=date or business_date(c)
+        try:dt.date.fromisoformat(report_date)
+        except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
+        return day_close(c,report_date)
 
 
 @app.get('/api/backups')

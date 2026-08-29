@@ -8,11 +8,27 @@ os.environ["JEWELLAN_DATA_DIR"] = str(TEST_DIR)
 from fastapi.testclient import TestClient
 from jewel_server.main import app
 
+TEST_ADMIN_PASSWORD = "JewelTest#1234"
+
 
 def auth_headers(client):
-    r = client.post("/api/auth/login", json={"username": "admin", "password": "Jewel@123", "client_name": "pytest"})
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}
+    last = None
+    for password in (TEST_ADMIN_PASSWORD, "Jewel@123"):
+        r = client.post("/api/auth/login", json={"username": "admin", "password": password, "client_name": "pytest"})
+        last = r
+        if r.status_code != 200:
+            continue
+        data = r.json()
+        headers = {"Authorization": f"Bearer {data['token']}"}
+        if data["user"].get("must_change_password"):
+            changed = client.post(
+                "/api/auth/change-password",
+                headers=headers,
+                json={"old_password": password, "new_password": TEST_ADMIN_PASSWORD},
+            )
+            assert changed.status_code == 200, changed.text
+        return headers
+    assert last is not None and last.status_code == 200, last.text if last is not None else "login failed"
 
 
 def test_health_login_inventory_sale_and_audit():

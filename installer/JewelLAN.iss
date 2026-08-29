@@ -1,5 +1,6 @@
 #define MyAppName "JewelLAN"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0-rc1"
+#define MyFileVersion "1.2.0.0"
 #define MyPublisher "JewelLAN"
 #define MyClientExe "JewelPOS.exe"
 #define MyServerExe "JewelServer.exe"
@@ -26,11 +27,11 @@ SetupLogging=yes
 UsePreviousSetupType=yes
 UsePreviousTasks=yes
 UninstallDisplayName=JewelLAN
-VersionInfoVersion={#MyAppVersion}
+VersionInfoVersion={#MyFileVersion}
 VersionInfoCompany={#MyPublisher}
 VersionInfoDescription=Offline jewellery ERP/POS for Windows LAN
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyFileVersion}
 
 [Types]
 Name: "full"; Description: "Server + Counter (recommended for the main showroom PC)"

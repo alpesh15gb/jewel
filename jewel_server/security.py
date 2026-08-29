@@ -204,6 +204,8 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
 
 def require(permission: str):
     def dep(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+        if user.get("must_change_password"):
+            raise HTTPException(status_code=428, detail="Password change required before using JewelLAN")
         perms = ROLE_PERMISSIONS.get(user["role"], set())
         if "*" not in perms and permission not in perms:
             raise HTTPException(status_code=403, detail="Permission denied")
