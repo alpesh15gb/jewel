@@ -94,15 +94,29 @@ CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_co
 CREATE TABLE IF NOT EXISTS sequences (name TEXT PRIMARY KEY,value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER REFERENCES users(id),action TEXT NOT NULL,entity TEXT NOT NULL,entity_id TEXT,details_json TEXT,client_ip TEXT,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC);
+CREATE TABLE IF NOT EXISTS tally_ledger_mappings (mapping_key TEXT PRIMARY KEY,tally_ledger_name TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tally_sync_queue (id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id INTEGER NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('create','cancel')),remote_id TEXT NOT NULL,payload_hash TEXT,tally_master_id TEXT,tally_voucher_no TEXT,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','synced','failed','conflict')),attempt_count INTEGER NOT NULL DEFAULT 0,last_error TEXT,response_json TEXT,next_attempt_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,synced_at TEXT,UNIQUE(entity_type,entity_id,operation));
+CREATE INDEX IF NOT EXISTS idx_tally_queue_status ON tally_sync_queue(status,next_attempt_at,id);
+CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
 """
+
+TALLY_DEFAULT_MAPPINGS={"cash":"Cash","bank":"Bank / Card / UPI","sales":"Jewellery Sales","inventory":"Jewellery Inventory","cogs":"Cost of Goods Sold","old_gold":"Old Gold Inventory","customer_receivables":"Sundry Debtors Control","supplier_payables":"Sundry Creditors Control","input_gst":"Input GST","cgst":"Output CGST 1.5%","sgst":"Output SGST 1.5%","igst":"Output IGST 3%","round_off":"Round Off"}
+
+def _migrate_schema(conn):
+    cols={r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()}
+    additions={"place_of_supply_code":"TEXT","cgst":"REAL NOT NULL DEFAULT 0","sgst":"REAL NOT NULL DEFAULT 0","igst":"REAL NOT NULL DEFAULT 0"}
+    for name,spec in additions.items():
+        if name not in cols:conn.execute(f"ALTER TABLE sales ADD COLUMN {name} {spec}")
+    conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)",(utcnow(),))
 
 DEFAULT_ACCOUNTS=[("1000","Cash","asset"),("1010","Bank / Card / UPI","asset"),("1100","Customer Receivables","asset"),("1200","Jewellery Inventory","asset"),("1210","Old Gold Inventory","asset"),("2000","Supplier Payables","liability"),("2100","GST Output Payable","liability"),("2110","GST Input Credit","asset"),("3000","Owner Equity","equity"),("4000","Jewellery Sales","income"),("4010","Making Charges Income","income"),("5000","Cost of Goods Sold","expense"),("6000","General Expenses","expense")]
 
 def init_db(password_hasher)->None:
     with connect() as conn:
-        conn.executescript(SCHEMA); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
+        conn.executescript(SCHEMA); _migrate_schema(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
         for code,name,typ in DEFAULT_ACCOUNTS: conn.execute("INSERT OR IGNORE INTO accounts(code,name,account_type,active) VALUES(?,?,?,1)",(code,name,typ))
-        defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30"}
+        for key,name in TALLY_DEFAULT_MAPPINGS.items(): conn.execute("INSERT OR IGNORE INTO tally_ledger_mappings(mapping_key,tally_ledger_name,updated_at) VALUES(?,?,?)",(key,name,now))
+        defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
         for k,v in defaults.items(): conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(k,v,now))
         if not conn.execute("SELECT id FROM users WHERE username='admin'").fetchone(): conn.execute("INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",("admin",password_hasher("Jewel@123"),"Administrator","admin",now,now))
         for seq in ("invoice","purchase","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))

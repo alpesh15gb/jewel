@@ -114,3 +114,10 @@ Before live rollout, test the exact barcode printer, invoice format, weighing sc
 ## Development status
 
 This repository is a complete v1 operational baseline rather than a mock UI: server, client, schema, transactional sale/purchase logic, PDFs, security, backups, tests and Windows packaging are present. Hardware-specific RFID/ZPL/TSPL integrations and government/cloud APIs are intentionally isolated as future adapters because they depend on the exact devices/services selected.
+
+
+## TallyPrime integration
+
+JewelLAN includes an optional **JewelTallyBridge.exe** for offline TallyPrime accounting sync. Install the Tally Bridge component on the Windows PC running TallyPrime. TallyPrime continues to listen only on localhost (normally port 9000); the authenticated JewelLAN bridge is the only service exposed to the Private LAN.
+
+Sales, sale COGS journals and purchases are committed to JewelLAN first and placed into a durable Tally sync queue in the same database transaction. Billing never waits for Tally. The queue uses stable REMOTEID values, exponential retry, response validation, configurable ledger mappings, automatic Sundry Debtor/Creditor ledger creation, and Day Book reconciliation. See `docs/TALLY_INTEGRATION.md`.

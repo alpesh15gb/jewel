@@ -3,6 +3,7 @@ import datetime as dt, sqlite3
 from typing import Any
 from fastapi import HTTPException
 from .db import audit,get_settings,next_sequence,utcnow
+from .tally import enqueue_tally
 
 def money(v): return round(float(v or 0)+1e-9,2)
 def weight(v): return round(float(v or 0)+1e-12,3)
@@ -12,6 +13,17 @@ def purity_fraction(purity:str)->float:
     try:
         v=float(p);return min(v/1000 if v>24 else v/24,1)
     except:return 1.0
+
+def _gst_state_code(value):
+    s=str(value or '').strip()
+    return s[:2] if len(s)>=2 and s[:2].isdigit() else ''
+
+def gst_components(conn,customer_id,gst,payload):
+    total=money(gst);settings=get_settings(conn);business=_gst_state_code(settings.get('business_state_code')) or _gst_state_code(settings.get('business_gstin'));customer=None
+    if customer_id:customer=conn.execute('SELECT gstin FROM customers WHERE id=?',(customer_id,)).fetchone()
+    place=_gst_state_code(payload.get('place_of_supply_code')) or (_gst_state_code(customer['gstin']) if customer else '') or business
+    if business and place and business!=place:return place,0.0,0.0,total
+    cgst=money(total/2);return place,cgst,money(total-cgst),0.0
 
 def latest_rate(conn,metal,purity):
     r=conn.execute("SELECT rate_per_gram FROM metal_rates WHERE lower(metal)=lower(?) AND lower(purity)=lower(?) ORDER BY effective_at DESC,id DESC LIMIT 1",(metal,purity)).fetchone()
@@ -56,7 +68,9 @@ def post_sale(conn,payload,user,client_ip=None):
     cash=money(payload.get('payment_cash'));card=money(payload.get('payment_card'));upi=money(payload.get('payment_upi'));credit=money(payload.get('payment_credit'));paid=money(cash+card+upi+credit+old_value)
     if abs(paid-q['total'])>.05:raise HTTPException(400,f"Payments ({paid:.2f}) must equal invoice total ({q['total']:.2f})")
     s=get_settings(conn);inv=next_sequence(conn,'invoice',s.get('invoice_prefix','INV')+'-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();cid=payload.get('customer_id') or None;bid=int(payload.get('branch_id') or 1);counter=payload.get('counter_id') or None
-    cur=conn.execute("INSERT INTO sales(invoice_no,client_request_id,branch_id,counter_id,customer_id,subtotal,discount,taxable,gst,round_off,total,payment_cash,payment_card,payment_upi,payment_credit,old_gold_value,notes,status,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posted',?,?)",(inv,req,bid,counter,cid,q['subtotal'],q['discount'],q['taxable'],q['gst'],q['round_off'],q['total'],cash,card,upi,credit,old_value,payload.get('notes'),user['id'],now));sid=cur.lastrowid;cost=0
+    if credit and not cid:raise HTTPException(400,'Credit payment requires a customer')
+    place,cgst,sgst,igst=gst_components(conn,cid,q['gst'],payload)
+    cur=conn.execute("INSERT INTO sales(invoice_no,client_request_id,branch_id,counter_id,customer_id,subtotal,discount,taxable,gst,place_of_supply_code,cgst,sgst,igst,round_off,total,payment_cash,payment_card,payment_upi,payment_credit,old_gold_value,notes,status,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posted',?,?)",(inv,req,bid,counter,cid,q['subtotal'],q['discount'],q['taxable'],q['gst'],place,cgst,sgst,igst,q['round_off'],q['total'],cash,card,upi,credit,old_value,payload.get('notes'),user['id'],now));sid=cur.lastrowid;cost=0
     for l in q['lines']:
         u=conn.execute("UPDATE items SET status='sold',version=version+1,updated_at=? WHERE id=? AND status='in_stock'",(now,l['item_id']))
         if u.rowcount!=1:raise HTTPException(409,f"Tag {l['tag_no']} was sold/moved by another counter")
@@ -74,7 +88,9 @@ def post_sale(conn,payload,user,client_ip=None):
     if q['round_off']>0:jl.append(('4000',0,q['round_off'],None,None))
     elif q['round_off']<0:jl.append(('4000',-q['round_off'],0,None,None))
     if cost:jl += [('5000',money(cost),0,None,None),('1200',0,money(cost),None,None)]
-    _journal(conn,user['id'],f'Sale {inv}','sale',sid,jl);audit(conn,user['id'],'create','sale',sid,{'invoice_no':inv,'total':q['total']},client_ip);return {'id':sid,'invoice_no':inv,'total':q['total'],'payable':q['payable'],'idempotent':False}
+    _journal(conn,user['id'],f'Sale {inv}','sale',sid,jl);audit(conn,user['id'],'create','sale',sid,{'invoice_no':inv,'total':q['total']},client_ip);enqueue_tally(conn,'sale',sid,'create');
+    if cost:enqueue_tally(conn,'sale_cogs',sid,'create')
+    return {'id':sid,'invoice_no':inv,'total':q['total'],'payable':q['payable'],'idempotent':False}
 
 def cancel_sale(conn,sale_id,user,reason='',client_ip=None):
     sale=conn.execute('SELECT * FROM sales WHERE id=?',(sale_id,)).fetchone()
@@ -89,7 +105,10 @@ def cancel_sale(conn,sale_id,user,reason='',client_ip=None):
     if sale['customer_id'] and sale['payment_credit']:conn.execute('UPDATE customers SET balance=max(0,balance-?),updated_at=? WHERE id=?',(sale['payment_credit'],now,sale['customer_id']))
     je=conn.execute("SELECT id FROM journal_entries WHERE ref_type='sale' AND ref_id=? ORDER BY id LIMIT 1",(sale_id,)).fetchone()
     if je:_journal(conn,user['id'],f"Cancel sale {sale['invoice_no']}: {reason}",'sale_cancel',sale_id,[(x['account_code'],x['credit'],x['debit'],x['party_type'],x['party_id']) for x in conn.execute('SELECT * FROM journal_lines WHERE entry_id=?',(je['id'],)).fetchall()])
-    audit(conn,user['id'],'cancel','sale',sale_id,{'reason':reason},client_ip);return {'ok':True,'invoice_no':sale['invoice_no']}
+    audit(conn,user['id'],'cancel','sale',sale_id,{'reason':reason},client_ip);enqueue_tally(conn,'sale',sale_id,'cancel');
+    cost=money(conn.execute('SELECT coalesce(sum(cost_amount),0) FROM sale_items WHERE sale_id=?',(sale_id,)).fetchone()[0])
+    if cost:enqueue_tally(conn,'sale_cogs',sale_id,'cancel')
+    return {'ok':True,'invoice_no':sale['invoice_no']}
 
 def create_item(conn,data,user_id,client_ip=None):
     s=get_settings(conn);tag=str(data.get('tag_no') or '').strip() or next_sequence(conn,'tag',s.get('tag_prefix','TAG')+'-',7);barcode=str(data.get('barcode') or tag).strip();gross=weight(data.get('gross_weight'));stone=weight(data.get('stone_weight'));net=weight(data.get('net_weight',gross-stone));purity=str(data.get('purity') or '916')

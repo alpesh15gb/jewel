@@ -357,7 +357,7 @@ class ReportsPage(Page):
 
 class AdminPage(Page):
     def __init__(self,parent,app):
-        super().__init__(parent,app);self.heading("Administration","Metal rates, users, backups, business settings and this workstation.");self.nb=ttk.Notebook(self);self.nb.pack(fill="both",expand=True);self.make_rates();self.make_backup();self.make_pc();
+        super().__init__(parent,app);self.heading("Administration","Metal rates, users, backups, business settings and this workstation.");self.nb=ttk.Notebook(self);self.nb.pack(fill="both",expand=True);self.make_rates();self.make_backup();self.make_pc();self.make_tally();
         if app.user.get("role")=="admin":self.make_users();self.make_business()
     def make_rates(self):
         f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Metal rates");ttk.Button(f,text="Add rate",command=self.rate).pack(anchor="w");h=ttk.Frame(f);h.pack(fill="both",expand=True,pady=8);self.rt=self.tree(h,("metal","purity","rate_per_gram","effective_at"));self.refresh_rates()
@@ -382,6 +382,35 @@ class AdminPage(Page):
     def save_pc(self):
         try:self.app.cfg.update({"server_url":self.pcv["server_url"].get(),"branch_id":int(self.pcv["branch_id"].get() or 1),"counter_id":int(self.pcv["counter_id"].get() or 1),"scale_port":self.pcv["scale_port"].get(),"scale_baud":int(self.pcv["scale_baud"].get() or 9600)});save_config(self.app.cfg);messagebox.showinfo("Workstation","Saved",parent=self)
         except Exception as e:self.app.error(e)
+    def make_tally(self):
+        f=ttk.Frame(self.nb,padding=10);self.nb.add(f,text="TallyPrime");self.tv={};self.tm={};self.tally_status=tk.StringVar(value="Loading Tally integration status…");ttk.Label(f,textvariable=self.tally_status,foreground="#555").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
+        try:d=self.api.get('/api/tally/status')
+        except Exception as e:d={'mappings':{}};self.tally_status.set(str(e))
+        fields=[('tally_enabled','Enabled (0/1)',d.get('enabled','0')),('tally_bridge_url','Bridge URL',d.get('bridge_url','http://127.0.0.1:8767')),('tally_bridge_token','Bridge token',''),('tally_company','Tally company',d.get('company','')),('business_state_code','Business state code',d.get('business_state_code','')),('tally_auto_create_parties','Auto-create party ledgers (0/1)',d.get('auto_create_parties','1'))]
+        r=1
+        for k,l,val in fields:self.tv[k]=tk.StringVar(value=str(val));ttk.Label(f,text=l).grid(row=r,column=0,sticky='w',pady=3);ttk.Entry(f,textvariable=self.tv[k],show='●' if k=='tally_bridge_token' else '').grid(row=r,column=1,sticky='ew',padx=8);r+=1
+        ttk.Separator(f).grid(row=r,column=0,columnspan=2,sticky='ew',pady=8);r+=1;ttk.Label(f,text='Ledger mappings',font=('Segoe UI',11,'bold')).grid(row=r,column=0,columnspan=2,sticky='w');r+=1
+        for k,val in d.get('mappings',{}).items():self.tm[k]=tk.StringVar(value=str(val));ttk.Label(f,text=k.replace('_',' ').title()).grid(row=r,column=0,sticky='w',pady=2);ttk.Entry(f,textvariable=self.tm[k]).grid(row=r,column=1,sticky='ew',padx=8);r+=1
+        b=ttk.Frame(f);b.grid(row=r,column=0,columnspan=2,sticky='ew',pady=10);ttk.Button(b,text='Save',command=self.save_tally).pack(side='left');ttk.Button(b,text='Test',command=self.test_tally).pack(side='left',padx=4);ttk.Button(b,text='Sync now',command=self.sync_tally).pack(side='left');ttk.Button(b,text='Reconcile',command=self.reconcile_tally).pack(side='left',padx=4);ttk.Button(b,text='Backfill',command=self.backfill_tally).pack(side='left');f.columnconfigure(1,weight=1)
+        bridge=d.get('bridge');q=d.get('queue',{});self.tally_status.set(('Connected' if bridge and bridge.get('ok') else 'Not connected')+f" | pending {q.get('pending',0)} failed {q.get('failed',0)} synced {q.get('synced',0)}")
+    def save_tally(self):
+        try:
+            p={k:v.get() for k,v in self.tv.items() if k!='tally_bridge_token' or v.get().strip()};self.api.put('/api/tally/settings',p);self.api.put('/api/tally/mappings',{k:v.get() for k,v in self.tm.items()});messagebox.showinfo('TallyPrime','Settings saved. Use Test before enabling live sync.',parent=self)
+        except Exception as e:self.app.error(e)
+    def test_tally(self):
+        try:r=self.api.post('/api/tally/test',{});missing=r.get('mappings',{}).get('missing',[]);messagebox.showinfo('TallyPrime',f"Bridge connected. Missing mapped ledgers: {', '.join(missing) if missing else 'none'}",parent=self)
+        except Exception as e:self.app.error(e)
+    def sync_tally(self):
+        try:r=self.api.post('/api/tally/sync-now',{'limit':100});messagebox.showinfo('TallyPrime',f"Processed {r['processed']} | Synced {r['synced']} | Failed {r['failed']}",parent=self)
+        except Exception as e:self.app.error(e)
+    def reconcile_tally(self):
+        try:r=self.api.get('/api/tally/reconcile',date_from=dt.date.today().replace(day=1).isoformat(),date_to=dt.date.today().isoformat());messagebox.showinfo('Tally reconciliation',f"Expected {r['expected_count']}\nFound {r['found_count']}\nMissing {len(r['missing'])}\nAmount mismatches {len(r['amount_mismatches'])}",parent=self)
+        except Exception as e:self.app.error(e)
+    def backfill_tally(self):
+        if not messagebox.askyesno('TallyPrime','Queue historical JewelLAN sales and purchases for Tally sync?',parent=self):return
+        try:r=self.api.post('/api/tally/backfill',{});messagebox.showinfo('TallyPrime',str(r),parent=self)
+        except Exception as e:self.app.error(e)
+
     def make_users(self):
         f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Users");ttk.Button(f,text="Add user",command=self.add_user).pack(anchor="w");h=ttk.Frame(f);h.pack(fill="both",expand=True,pady=8);self.ut=self.tree(h,("username","full_name","role","active","must_change_password"));self.refresh_users()
     def refresh_users(self):
