@@ -1,0 +1,35 @@
+name: Apply release TLS
+
+on:
+  push:
+    branches: [production-release]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production-release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply committed-source TLS changes
+        shell: pwsh
+        run: |
+          python scripts/apply_release_tls.py
+          python -m compileall -q jewel_client jewel_server scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Commit generated TLS source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jewel_client/main.py jewel_server/main.py installer/JewelLAN.iss
+          git diff --cached --quiet && exit 0
+          git commit -m "Enable pinned HTTPS in production release"
+          git push origin HEAD:production-release
