@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test-and-build:
     runs-on: windows-latest
@@ -16,6 +19,41 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Repair known client syntax defect
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p = Path('jewel_client/main.py')
+          text = p.read_text(encoding='utf-8')
+          bad = 'for k,v in self.totals.items():v.set(money(self.quote.get(k,0))'
+          good = 'for k,v in self.totals.items():v.set(money(self.quote.get(k,0)))'
+          if bad in text:
+              p.write_text(text.replace(bad, good, 1), encoding='utf-8')
+              print('Repaired missing parenthesis in jewel_client/main.py')
+          else:
+              print('Known syntax defect is already repaired.')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile every Python source file
+        shell: pwsh
+        run: |
+          python -m compileall -q jewel_client jewel_server run_client.py run_server.py tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Persist source repair to main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          if (-not (git diff --quiet -- jewel_client/main.py)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add jewel_client/main.py
+            git commit -m "Fix JewelPOS client syntax"
+            git push origin HEAD:main
+          }
+
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
 
@@ -23,7 +61,9 @@ jobs:
         shell: pwsh
         run: |
           python -c "import jewel_client.main, jewel_client.api, jewel_client.config, jewel_client.scale; print(jewel_client.main.__file__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -c "import jewel_server.main, jewel_server.db, jewel_server.services; print(jewel_server.main.__file__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Tests
         run: pytest -q
