@@ -28,7 +28,11 @@ def test_tall_inventory_form_keeps_save_action_visible():
         canvas = getattr(dialog, "form_canvas", None)
         observed["save_exists"] = save is not None
         if save is not None:
-            observed["save_mapped"] = bool(save.winfo_ismapped())
+            # The test root is intentionally withdrawn, so winfo_ismapped() is
+            # false for descendants even when Tk has correctly laid them out.
+            # Verify that Save is managed by pack and sits inside the dialog.
+            observed["save_managed"] = save.winfo_manager() == "pack"
+            observed["save_text"] = str(save.cget("text"))
             observed["save_inside"] = (
                 save.winfo_rooty() + save.winfo_height()
                 <= dialog.winfo_rooty() + dialog.winfo_height()
@@ -47,6 +51,7 @@ def test_tall_inventory_form_keeps_save_action_visible():
     root.destroy()
 
     assert observed.get("save_exists"), observed
-    assert observed.get("save_mapped"), observed
+    assert observed.get("save_managed"), observed
+    assert observed.get("save_text") == "Save", observed
     assert observed.get("save_inside"), observed
     assert observed.get("scrollable"), observed
