@@ -130,9 +130,13 @@ class Api:
         url = self.base_url + path
         tries = 2 if method.upper() == "GET" and retry_get else 1
         last = None
+        # JewelLAN uses a self-signed private-LAN certificate. CA-chain verification
+        # must therefore be disabled for HTTPS requests, while FingerprintAdapter
+        # still enforces the exact pinned SHA-256 certificate fingerprint.
+        verify = not (self.base_url.startswith("https://") and bool(self.fingerprint))
         for attempt in range(tries):
             try:
-                r = self.session.request(method, url, headers=self.headers(), params=params, json=json_body, timeout=timeout)
+                r = self.session.request(method, url, headers=self.headers(), params=params, json=json_body, timeout=timeout, verify=verify)
                 if r.status_code >= 400:
                     try:
                         detail = r.json().get("detail", r.text)
