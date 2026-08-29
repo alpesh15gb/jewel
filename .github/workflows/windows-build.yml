@@ -39,10 +39,10 @@ jobs:
       - name: Verify bundled application packages
         shell: pwsh
         run: |
-          $client = pyinstaller-archive_viewer -l dist/JewelPOS.exe | Out-String
+          $client = python -m PyInstaller.utils.cliutils.archive_viewer -l dist/JewelPOS.exe | Out-String
           if ($client -notmatch 'jewel_client\.main') { throw 'JewelPOS.exe is missing jewel_client.main' }
           if ($client -notmatch 'jewel_client\.api') { throw 'JewelPOS.exe is missing jewel_client.api' }
-          $server = pyinstaller-archive_viewer -l dist/JewelServer.exe | Out-String
+          $server = python -m PyInstaller.utils.cliutils.archive_viewer -l dist/JewelServer.exe | Out-String
           if ($server -notmatch 'jewel_server\.main') { throw 'JewelServer.exe is missing jewel_server.main' }
 
       - name: Smoke test JewelPOS launch
