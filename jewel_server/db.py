@@ -513,6 +513,8 @@ def _migration_6(conn) -> None:
         conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_state_code'", (now,))
         conn.execute("UPDATE branches SET name='Main Showroom',gstin='',address='',phone='' WHERE id=?", (branch["id"],))
         conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
 
     now = utcnow()
     defaults = {
