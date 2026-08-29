@@ -14,6 +14,7 @@ from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity
 from .integrity import database_integrity,day_close
 from .precision import money_paise,money_sum
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
+from .tls import tls_identity
 
 PRODUCTION_HARDENED_V1 = True
 APP_VERSION='1.2.0-rc1'
@@ -431,11 +432,19 @@ def backup(p:dict=Body(default={}),u=Depends(require('backup'))):
 def logs(limit:int=Query(200,le=1000),u=Depends(require('*'))):
     with read_db() as c:return rowsdict(c.execute('SELECT l.*,u.username FROM audit_log l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT ?',(limit,)).fetchall())
 
-def lan_addresses(port):
-    try:return sorted({f'http://{x}:{port}' for x in socket.gethostbyname_ex(socket.gethostname())[2] if not x.startswith('127.')})
+def lan_addresses(port,scheme='https'):
+    try:return sorted({f'{scheme}://{x}:{port}' for x in socket.gethostbyname_ex(socket.gethostname())[2] if not x.startswith('127.')})
     except:return []
 def cli():
-    p=argparse.ArgumentParser(description='JewelLAN offline jewellery ERP server');p.add_argument('--host',default=os.environ.get('JEWELLAN_HOST','0.0.0.0'));p.add_argument('--port',type=int,default=int(os.environ.get('JEWELLAN_PORT','8765')));p.add_argument('--restore');a=p.parse_args()
+    p=argparse.ArgumentParser(description='JewelLAN offline jewellery ERP server');p.add_argument('--host',default=os.environ.get('JEWELLAN_HOST','0.0.0.0'));p.add_argument('--port',type=int,default=int(os.environ.get('JEWELLAN_PORT','8765')));p.add_argument('--restore');p.add_argument('--show-fingerprint',action='store_true');p.add_argument('--insecure-http',action='store_true',help='Development only: disable TLS on the private LAN');a=p.parse_args()
     if a.restore:init_db(hash_password);result=restore_backup(a.restore);init_db(hash_password);print('Backup restored and migrated:',result);return
-    os.environ['JEWELLAN_PORT']=str(a.port);print('\nJewelLAN Server - OFFLINE LAN MODE');print('Local:',f'http://127.0.0.1:{a.port}');[print('LAN:  ',x) for x in lan_addresses(a.port)];print('Default first login: admin / Jewel@123 (change it immediately; new passwords require 10+ characters)\n');uvicorn.run(app,host=a.host,port=a.port,log_level='info',access_log=False)
+    identity=tls_identity()
+    if a.show_fingerprint:print(identity['fingerprint']);return
+    os.environ['JEWELLAN_PORT']=str(a.port);scheme='http' if a.insecure_http else 'https'
+    if a.insecure_http:os.environ['JEWELLAN_INSECURE_HTTP']='1'
+    else:os.environ.pop('JEWELLAN_INSECURE_HTTP',None)
+    print('\nJewelLAN Server - OFFLINE PRIVATE LAN MODE');print('Transport:',scheme.upper());print('Certificate SHA-256:',identity['fingerprint']);print('Local:',f'{scheme}://127.0.0.1:{a.port}');[print('LAN:  ',x) for x in lan_addresses(a.port,scheme)];print('Default first login: admin / Jewel@123 (change it immediately; new passwords require 10+ characters)\n')
+    kwargs={'host':a.host,'port':a.port,'log_level':'info','access_log':False}
+    if not a.insecure_http:kwargs.update(ssl_certfile=identity['cert'],ssl_keyfile=identity['key'],ssl_version=2)
+    uvicorn.run(app,**kwargs)
 if __name__=='__main__':cli()

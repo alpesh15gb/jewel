@@ -80,11 +80,10 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""J
 Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""JewelLAN Server"" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR ""{commonappdata}\JewelLAN\bin\{#MyServerExe} --host 0.0.0.0 --port 8765"" /F"; Flags: runhidden; Components: server
 Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""JewelLAN Server"""; Flags: runhidden; Components: server
 
-; Tally Bridge is exposed only to the Private LAN; TallyPrime itself remains localhost-only.
+; Tally Bridge remains loopback-only by default so its bearer token never crosses the LAN in clear text.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""JewelLAN Tally Bridge TCP"""; Flags: runhidden; Components: tallybridge
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""JewelLAN Tally Bridge"" /F"; Flags: runhidden; Components: tallybridge
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""JewelLAN Tally Bridge TCP"" dir=in action=allow protocol=TCP localport=8767 profile=private enable=yes"; Flags: runhidden; Components: tallybridge
-Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""JewelLAN Tally Bridge"" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR ""{commonappdata}\JewelLAN\bin\{#MyBridgeExe} --host 0.0.0.0 --port 8767 --tally-url http://127.0.0.1:9000"" /F"; Flags: runhidden; Components: tallybridge
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /TN ""JewelLAN Tally Bridge"" /SC ONSTART /RU SYSTEM /RL HIGHEST /TR ""{commonappdata}\JewelLAN\bin\{#MyBridgeExe} --host 127.0.0.1 --port 8767 --tally-url http://127.0.0.1:9000"" /F"; Flags: runhidden; Components: tallybridge
 Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""JewelLAN Tally Bridge"""; Flags: runhidden; Components: tallybridge
 
 ; Counter users can launch immediately after setup.
