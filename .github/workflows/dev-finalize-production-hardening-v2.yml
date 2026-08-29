@@ -28,12 +28,12 @@ jobs:
         run: |
           python -m compileall -q jewel_client jewel_server jewel_tally_bridge run_client.py run_server.py run_tally_bridge.py tests scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Commit release-gate changes
+      - name: Commit release-gate source changes
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add jewel_server/main.py jewel_server/tally.py installer/JewelLAN.iss .github/workflows/windows-build.yml
+          git add jewel_server/main.py jewel_server/tally.py installer/JewelLAN.iss
           git diff --cached --quiet && exit 0
-          git commit -m "Finalize v2 business dates packaging and Data Health smoke"
+          git commit -m "Finalize v2 business dates and installer version"
           git push origin HEAD:production-hardening-v2
