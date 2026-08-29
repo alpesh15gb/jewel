@@ -491,8 +491,8 @@ def force_initial_password_change(root,api,user):
     return True
 
 
-class LoginDialog'''
-    text = replace_between(text, "class LoginDialog", "class Page", password_dialog, "masked mandatory password dialog")
+'''
+    text = replace_once(text, "class LoginDialog(tk.Toplevel):", password_dialog + "\n\nclass LoginDialog(tk.Toplevel):", "masked mandatory password dialog")
     old_change = '''    def change_password(self, forced=False):
         data = form_dialog(self.root, "Change password", [("old_password","Current password"),("new_password","New password"),("again","Repeat new password")])
         if not data:

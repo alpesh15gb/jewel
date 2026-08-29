@@ -106,6 +106,42 @@ def form_dialog(parent, title, fields, defaults=None):
     parent.wait_window(d)
     return result["value"]
 
+def password_change_dialog(parent, title="Change password", forced=False):
+    d=tk.Toplevel(parent);d.title(title);d.configure(bg=PALETTE["bg"]);center(d,500,360);d.resizable(False,False);d.transient(parent);d.grab_set();result={"value":None}
+    shell=ttk.Frame(d,style="Surface.TFrame",padding=24);shell.pack(fill="both",expand=True,padx=18,pady=18)
+    ttk.Label(shell,text=title,style="Section.TLabel",font=("Segoe UI Semibold",15)).pack(anchor="w")
+    ttk.Label(shell,text="Use at least 10 characters. This password is stored only as a secure hash on your JewelLAN server.",style="SurfaceMuted.TLabel",wraplength=420).pack(anchor="w",pady=(4,16))
+    vars_={k:tk.StringVar() for k in ("old_password","new_password","again")};labels=(("old_password","Current password"),("new_password","New password"),("again","Repeat new password"))
+    first=None
+    for key,label in labels:
+        ttk.Label(shell,text=label,style="SurfaceMuted.TLabel").pack(anchor="w",pady=(5,3));e=ttk.Entry(shell,textvariable=vars_[key],show="●");e.pack(fill="x",ipady=3)
+        if first is None:first=e
+    def save():result["value"]={k:v.get() for k,v in vars_.items()};d.destroy()
+    b=ttk.Frame(shell,style="Surface.TFrame");b.pack(fill="x",pady=(18,0));ttk.Button(b,text="Save password",style="Primary.TButton",command=save).pack(side="right")
+    if not forced:ttk.Button(b,text="Cancel",style="Secondary.TButton",command=d.destroy).pack(side="right",padx=(0,8))
+    else:d.protocol("WM_DELETE_WINDOW",lambda:None)
+    d.bind("<Return>",lambda _e:save());
+    if not forced:d.bind("<Escape>",lambda _e:d.destroy())
+    if first:first.focus_set()
+    parent.wait_window(d);return result["value"]
+
+
+def force_initial_password_change(root,api,user):
+    while user.get("must_change_password"):
+        data=password_change_dialog(root,"Password change required",True)
+        if not data:return False
+        if len(data["new_password"])<10:
+            messagebox.showerror("Password","New password must be at least 10 characters.",parent=root);continue
+        if data["new_password"]!=data["again"]:
+            messagebox.showerror("Password","New passwords do not match.",parent=root);continue
+        try:
+            api.post("/api/auth/change-password",{"old_password":data["old_password"],"new_password":data["new_password"]});user["must_change_password"]=0;messagebox.showinfo("Password","Password changed. JewelLAN is ready to use.",parent=root);return True
+        except Exception as e:messagebox.showerror("Password change failed",str(e),parent=root)
+    return True
+
+
+
+
 class LoginDialog(tk.Toplevel):
     def __init__(self, master, api: Api, cfg: dict):
         super().__init__(master); self.api = api; self.cfg = cfg; self.user = None
@@ -177,7 +213,6 @@ class App(ttk.Frame):
         if os.name == "nt": root.state("zoomed")
         else: root.geometry("1360x850")
         self.load_settings(); self.build()
-        if user.get("must_change_password"): root.after(400, lambda: self.change_password(True))
 
     def load_settings(self):
         d = self.api.get("/api/settings"); self.settings, self.branches, self.counters = d["settings"], d["branches"], d["counters"]
@@ -223,16 +258,12 @@ class App(ttk.Frame):
     def error(self, e): messagebox.showerror("JewelLAN", str(e), parent=self.root)
 
     def change_password(self, forced=False):
-        data = form_dialog(self.root, "Change password", [("old_password","Current password"),("new_password","New password"),("again","Repeat new password")])
-        if not data:
-            if forced: self.root.after(300, lambda: self.change_password(True))
-            return
-        if data["new_password"] != data["again"]: self.error("New passwords do not match"); return
-        try:
-            self.api.post("/api/auth/change-password", {"old_password": data["old_password"], "new_password": data["new_password"]}); self.user["must_change_password"] = 0
-            messagebox.showinfo("Password", "Password changed.", parent=self.root)
-        except Exception as e:
-            self.error(e); self.root.after(300, lambda: self.change_password(True)) if forced else None
+        data=password_change_dialog(self.root,"Change password",forced)
+        if not data:return
+        if len(data["new_password"])<10:self.error("New password must be at least 10 characters");return
+        if data["new_password"]!=data["again"]:self.error("New passwords do not match");return
+        try:self.api.post("/api/auth/change-password",{"old_password":data["old_password"],"new_password":data["new_password"]});self.user["must_change_password"]=0;messagebox.showinfo("Password","Password changed.",parent=self.root)
+        except Exception as e:self.error(e)
 
 class DashboardPage(Page):
     def __init__(self, parent, app):
@@ -574,7 +605,7 @@ class TallyPage(Page):
 
 class AdminPage(Page):
     def __init__(self,parent,app):
-        super().__init__(parent,app);self.heading("Administration","Metal rates, users, backups, business settings and this workstation.");self.nb=ttk.Notebook(self);self.nb.pack(fill="both",expand=True);self.make_rates();self.make_backup();self.make_pc();
+        super().__init__(parent,app);self.heading("Administration","Metal rates, users, backups, integrity, business settings and this workstation.");self.nb=ttk.Notebook(self);self.nb.pack(fill="both",expand=True);self.make_rates();self.make_health();self.make_backup();self.make_pc();
         if app.user.get("role")=="admin":self.make_users();self.make_business()
     def make_rates(self):
         f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Metal rates");ttk.Button(f,text="Add rate",command=self.rate).pack(anchor="w");h=ttk.Frame(f);h.pack(fill="both",expand=True,pady=8);self.rt=self.tree(h,("metal","purity","rate_per_gram","effective_at"));self.refresh_rates()
@@ -587,6 +618,18 @@ class AdminPage(Page):
         if d:
             try:d["rate_per_gram"]=float(d["rate_per_gram"]);self.api.post("/api/rates",d);self.refresh_rates()
             except Exception as e:self.app.error(e)
+    def make_health(self):
+        f=ttk.Frame(self.nb,padding=12);self.nb.add(f,text="Data health");bar=ttk.Frame(f);bar.pack(fill="x");ttk.Button(bar,text="Refresh checks",command=self.refresh_health).pack(side="left");ttk.Button(bar,text="Create verified backup",command=self.health_backup).pack(side="left",padx=6);self.health_status=tk.StringVar(value="Not checked yet");ttk.Label(f,textvariable=self.health_status,style="SurfaceMuted.TLabel",wraplength=900).pack(anchor="w",pady=(10,8));self.health_text=tk.Text(f,height=18,wrap="word",font=("Consolas",9));self.health_text.pack(fill="both",expand=True);self.refresh_health()
+    def refresh_health(self):
+        try:
+            i=self.api.get('/api/integrity');d=self.api.get('/api/reports/day-close');b=self.api.get('/api/health').get('backup',{});ok=bool(i.get('ok')) and bool(d.get('journal',{}).get('balanced')) and bool(d.get('sales',{}).get('payments_match_sales'));self.health_status.set(('PASS' if ok else 'ATTENTION REQUIRED')+f" · integrity issues {i.get('issue_count',0)} · canonical mismatches {i.get('canonical',{}).get('mismatches',0)}")
+            lines=[f"Database quick check: {i.get('sqlite_quick_check')}",f"Foreign-key violations: {i.get('foreign_key_violations')}",f"Audit chain: {'OK' if i.get('audit_chain',{}).get('ok') else 'FAILED'}",f"Exact paise/mg mirrors: {'OK' if i.get('canonical',{}).get('ok') else 'FAILED'}",f"Today sales: {d.get('sales',{}).get('count',0)} · {money(d.get('sales',{}).get('total',0))}",f"Payment reconciliation: {'OK' if d.get('sales',{}).get('payments_match_sales') else 'FAILED'}",f"Journal balance: {'OK' if d.get('journal',{}).get('balanced') else 'FAILED'}",f"Last backup: {b.get('at','none')} · {'OK' if b.get('ok') else 'not verified'}"]
+            if i.get('issues'):lines.append("\nIssues:\n"+"\n".join(f"- {x.get('message',x)}" for x in i['issues'][:30]));self.health_text.delete('1.0','end');self.health_text.insert('1.0','\n'.join(lines))
+        except Exception as e:self.health_status.set('Health check failed');self.health_text.delete('1.0','end');self.health_text.insert('1.0',str(e))
+    def health_backup(self):
+        try:r=self.api.post('/api/backups',{'label':'health-check'});messagebox.showinfo('Verified backup',f"Created {r['name']}\nSHA-256 {r.get('sha256','')}\nVerified: {r.get('verified')}",parent=self);self.refresh_health()
+        except Exception as e:self.app.error(e)
+
     def make_backup(self):
         f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Backups");ttk.Button(f,text="Create backup now",command=lambda:self.api.post("/api/backups",{"label":"manual"})).pack(anchor="w");ttk.Label(f,text="Backups stay on the server PC. Restore is a server-admin operation while JewelLAN is stopped.",foreground="#666").pack(anchor="w",pady=10)
     def make_pc(self):
@@ -640,7 +683,7 @@ class AdminPage(Page):
             try:self.api.post("/api/users",d);self.refresh_users()
             except Exception as e:self.app.error(e)
     def make_business(self):
-        f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Business");keys=("business_name","business_address","business_phone","business_gstin","invoice_prefix","tag_prefix","gst_default","label_width_mm","label_height_mm","backup_interval_hours","backup_retention_days");self.bv={}
+        f=ttk.Frame(self.nb,padding=8);self.nb.add(f,text="Business");keys=("business_name","business_address","business_phone","business_gstin","business_timezone_offset_minutes","invoice_prefix","tag_prefix","gst_default","label_width_mm","label_height_mm","backup_interval_hours","backup_retention_days");self.bv={}
         for i,k in enumerate(keys):self.bv[k]=tk.StringVar(value=self.app.settings.get(k,""));ttk.Label(f,text=k.replace("_"," ").title()).grid(row=i,column=0,sticky="w",pady=3);ttk.Entry(f,textvariable=self.bv[k]).grid(row=i,column=1,sticky="ew",padx=8)
         f.columnconfigure(1,weight=1);ttk.Button(f,text="Save",command=self.save_business).grid(row=len(keys)+1,column=0,columnspan=2,sticky="ew",pady=10)
     def save_business(self):
@@ -651,6 +694,7 @@ class AdminPage(Page):
 def main():
     root=tk.Tk();root.withdraw();cfg=load_config();api=Api(cfg.get("server_url",""));login=LoginDialog(root,api,cfg);root.wait_window(login)
     if not login.user:return
+    if login.user.get("must_change_password") and not force_initial_password_change(root,api,login.user):return
     root.deiconify();App(root,api,cfg,login.user);root.mainloop()
 
 

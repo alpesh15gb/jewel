@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .audit_chain import verify_audit_chain
+from .canonical import canonical_integrity, paise_to_money
 from .precision import money, money_equal, money_paise, weight_equal
 
 _HUID_RE = re.compile(r"^[A-Z0-9]{6}$")
@@ -169,6 +170,11 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
         for row in audit["errors"][:20]:
             _append(issues, "audit_chain", f"Audit chain mismatch at entry {row['id']}", audit_id=row["id"])
 
+    canonical = canonical_integrity(conn, max_errors=max_details)
+    if not canonical["ok"]:
+        for row in canonical["errors"][:20]:
+            _append(issues, "canonical", f"Exact paise/milligram mirror mismatch in {row['table']}", **row)
+
     all_issues = issues
     return {
         "ok": quick_ok and not fk_rows and not all_issues,
@@ -183,6 +189,7 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
         "missing_journals": missing_journal,
         "stock_state_mismatches": stock_state_errors + len(orphan_sold),
         "audit_chain": audit,
+        "canonical": canonical,
         "issues": all_issues[:max_details],
         "issue_count": len(all_issues),
     }
@@ -190,22 +197,22 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
 
 def day_close(conn, business_date: str) -> dict[str, Any]:
     sale = conn.execute(
-        "SELECT count(*) c,coalesce(sum(total),0) total,coalesce(sum(taxable),0) taxable,coalesce(sum(gst),0) gst,"
-        "coalesce(sum(payment_cash),0) cash,coalesce(sum(payment_card),0) card,coalesce(sum(payment_upi),0) upi,"
-        "coalesce(sum(payment_credit),0) credit,coalesce(sum(old_gold_value),0) old_gold "
-        "FROM sales WHERE status='posted' AND substr(created_at,1,10)=?",
+        "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(taxable_paise),0) taxable,coalesce(sum(gst_paise),0) gst,"
+        "coalesce(sum(payment_cash_paise),0) cash,coalesce(sum(payment_card_paise),0) card,coalesce(sum(payment_upi_paise),0) upi,"
+        "coalesce(sum(payment_credit_paise),0) credit,coalesce(sum(old_gold_value_paise),0) old_gold "
+        "FROM sales WHERE status='posted' AND business_date=?",
         (business_date,),
     ).fetchone()
     cancelled = conn.execute(
-        "SELECT count(*) FROM sales WHERE status='cancelled' AND substr(cancelled_at,1,10)=?",
+        "SELECT count(*) FROM sales WHERE status='cancelled' AND business_date=?",
         (business_date,),
     ).fetchone()[0]
     purchase = conn.execute(
-        "SELECT count(*) c,coalesce(sum(total),0) total,coalesce(sum(paid),0) paid FROM purchases WHERE substr(created_at,1,10)=?",
+        "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(paid_paise),0) paid FROM purchases WHERE business_date=?",
         (business_date,),
     ).fetchone()
     journal = conn.execute(
-        "SELECT coalesce(sum(l.debit),0) debit,coalesce(sum(l.credit),0) credit "
+        "SELECT coalesce(sum(l.debit_paise),0) debit,coalesce(sum(l.credit_paise),0) credit "
         "FROM journal_entries e JOIN journal_lines l ON l.entry_id=e.id WHERE e.entry_date=?",
         (business_date,),
     ).fetchone()
@@ -213,28 +220,17 @@ def day_close(conn, business_date: str) -> dict[str, Any]:
         "SELECT count(*) FROM stock_movements WHERE substr(created_at,1,10)=?",
         (business_date,),
     ).fetchone()[0]
-    payment_total = money(sale["cash"] + sale["card"] + sale["upi"] + sale["credit"] + sale["old_gold"])
+    payment_paise = int(sale["cash"] + sale["card"] + sale["upi"] + sale["credit"] + sale["old_gold"])
     return {
         "date": business_date,
         "sales": {
-            "count": sale["c"],
-            "total": money(sale["total"]),
-            "taxable": money(sale["taxable"]),
-            "gst": money(sale["gst"]),
-            "cash": money(sale["cash"]),
-            "card": money(sale["card"]),
-            "upi": money(sale["upi"]),
-            "credit": money(sale["credit"]),
-            "old_gold": money(sale["old_gold"]),
-            "payment_total": payment_total,
-            "payments_match_sales": money_equal(payment_total, sale["total"]),
+            "count": sale["c"], "total": paise_to_money(sale["total"]), "taxable": paise_to_money(sale["taxable"]),
+            "gst": paise_to_money(sale["gst"]), "cash": paise_to_money(sale["cash"]), "card": paise_to_money(sale["card"]),
+            "upi": paise_to_money(sale["upi"]), "credit": paise_to_money(sale["credit"]), "old_gold": paise_to_money(sale["old_gold"]),
+            "payment_total": paise_to_money(payment_paise), "payments_match_sales": payment_paise == int(sale["total"]),
         },
         "cancelled_sales": cancelled,
-        "purchases": {"count": purchase["c"], "total": money(purchase["total"]), "paid": money(purchase["paid"])},
-        "journal": {
-            "debit": money(journal["debit"]),
-            "credit": money(journal["credit"]),
-            "balanced": money_equal(journal["debit"], journal["credit"]),
-        },
+        "purchases": {"count": purchase["c"], "total": paise_to_money(purchase["total"]), "paid": paise_to_money(purchase["paid"])},
+        "journal": {"debit": paise_to_money(journal["debit"]), "credit": paise_to_money(journal["credit"]), "balanced": int(journal["debit"]) == int(journal["credit"])},
         "stock_movements": movement_count,
     }
