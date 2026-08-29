@@ -1,0 +1,45 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Tests
+        run: pytest -q
+      - name: Build server EXE
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --name JewelServer
+          --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab
+          run_server.py
+      - name: Build Windows client EXE
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed --name JewelPOS
+          --collect-all requests --collect-all reportlab --hidden-import serial
+          run_client.py
+      - name: Make distribution zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/JewelLAN | Out-Null
+          Copy-Item dist/JewelServer.exe dist/JewelLAN/
+          Copy-Item dist/JewelPOS.exe dist/JewelLAN/
+          Copy-Item scripts/*.ps1 dist/JewelLAN/
+          Copy-Item README.md dist/JewelLAN/
+          Compress-Archive -Path dist/JewelLAN/* -DestinationPath dist/JewelLAN-Windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JewelLAN-Windows
+          path: dist/JewelLAN-Windows.zip
+          if-no-files-found: error
