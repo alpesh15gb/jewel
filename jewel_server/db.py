@@ -484,8 +484,6 @@ def _migration_5(conn) -> None:
         if conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Main Counter'",(bid,)).fetchone() and not conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Counter 1'",(bid,)).fetchone():
             conn.execute("UPDATE counters SET name='Counter 1' WHERE branch_id=? AND name='Main Counter'",(bid,))
         conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(bid,))
-        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 2',1)",(bid,))
-        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 3',1)",(bid,))
     conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES('return',0)")
 
 
@@ -498,7 +496,7 @@ def _migration_6(conn) -> None:
     obsolete seed shipped in the release candidates.
     """
     counts = 0
-    for table in ("items", "sales", "purchases", "customers", "suppliers", "karigars", "repairs", "orders", "approvals"):
+    for table in ("items", "sales", "sale_returns", "purchases", "customers", "suppliers", "karigars", "repairs", "orders", "approvals", "stock_audits"):
         counts += int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
     business = conn.execute("SELECT value FROM settings WHERE key='business_name'").fetchone()
     branch = conn.execute("SELECT id,name FROM branches WHERE code='MAIN'").fetchone()
@@ -514,6 +512,7 @@ def _migration_6(conn) -> None:
         conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_name'", (now,))
         conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_state_code'", (now,))
         conn.execute("UPDATE branches SET name='Main Showroom',gstin='',address='',phone='' WHERE id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
 
     now = utcnow()
     defaults = {

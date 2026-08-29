@@ -266,7 +266,9 @@ class App(ttk.Frame):
         if role in ("admin","manager","cashier"): pages.append(("Repairs & Orders", JobsPage))
         if role in ("admin","manager","inventory"): pages.append(("Stock Audit", StockAuditPage))
         if role in ("admin","manager","accounts"): pages.append(("Reports", ReportsPage))
-        if role in ("admin","manager"): pages.append(("TallyPrime", TallyPage)); pages.append(("Administration", AdminPage))
+        if role in ("admin","manager"):
+            pages.append(("TallyPrime", TallyPage))
+            pages.append(("Administration", AdminPage))
         for name, cls in pages:
             b = ttk.Button(nav, text=name, style="Nav.TButton", command=lambda c=cls,n=name: self.show(c,n)); b.pack(fill="x", padx=10, pady=1); self.nav_buttons[name] = b
 
