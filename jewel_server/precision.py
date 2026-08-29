@@ -47,6 +47,24 @@ def weight_mg(value: Any) -> int:
     return int((weight_decimal(value) * 1000).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+def paise_money(value: Any) -> float:
+    """Convert canonical integer paise to a 2-decimal compatibility value without float arithmetic."""
+    try:
+        paise = int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("paise must be an integer") from exc
+    return float((Decimal(paise) / Decimal(100)).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))
+
+
+def mg_weight(value: Any) -> float:
+    """Convert canonical integer milligrams to a 3-decimal compatibility weight."""
+    try:
+        mg = int(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("milligrams must be an integer") from exc
+    return float((Decimal(mg) / Decimal(1000)).quantize(WEIGHT_QUANT, rounding=ROUND_HALF_UP))
+
+
 def money_sum(values: Iterable[Any]) -> float:
     total = sum((money_decimal(v) for v in values), ZERO)
     return float(total.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))
