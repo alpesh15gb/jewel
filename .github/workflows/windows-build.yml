@@ -26,6 +26,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/apply_ui_redesign.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/apply_tally_xml_compat.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile every Python source file
         shell: pwsh
@@ -40,7 +42,7 @@ jobs:
           if (-not (git diff --quiet)) {
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add jewel_client jewel_server installer README.md
+            git add jewel_client jewel_server jewel_tally_bridge tests installer README.md
             git commit -m "Apply JewelLAN generated source upgrades"
             git push origin HEAD:main
           }
@@ -51,7 +53,7 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main; print('imports ok')"
+          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main, jewel_tally_bridge.xml_compat; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test redesigned desktop UI
@@ -124,6 +126,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --name JewelTallyBridge
           --paths .
           --hidden-import jewel_tally_bridge --hidden-import jewel_tally_bridge.main
+          --hidden-import jewel_tally_bridge.xml_compat
           --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all requests
           run_tally_bridge.py
 
