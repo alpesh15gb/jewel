@@ -31,7 +31,7 @@ VersionInfoVersion={#MyFileVersion}
 VersionInfoCompany={#MyPublisher}
 VersionInfoDescription=Offline jewellery ERP/POS for Windows LAN
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyFileVersion}
 
 [Types]
 Name: "full"; Description: "Server + Counter (recommended for the main showroom PC)"
