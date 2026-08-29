@@ -88,6 +88,33 @@ def _return_payload(conn, return_id: int) -> dict[str, Any]:
     return {"return": r, "items": items}
 
 
+def quote_sale_return(conn, sale_id: int, sale_item_ids: list[int] | None = None) -> dict[str, Any]:
+    sale_row=conn.execute("SELECT * FROM sales WHERE id=?",(sale_id,)).fetchone()
+    if not sale_row:raise HTTPException(404,"Sale not found")
+    sale=dict(sale_row)
+    if sale["status"]!="posted":raise HTTPException(409,"Cancelled invoices cannot be returned")
+    requested=[] if sale_item_ids is None else [int(x) for x in sale_item_ids]
+    if len(requested)!=len(set(requested)):raise HTTPException(400,"Select unique invoice items")
+    all_lines=conn.execute("SELECT si.*,i.status item_status FROM sale_items si JOIN items i ON i.id=si.item_id WHERE si.sale_id=? ORDER BY si.id",(sale_id,)).fetchall()
+    line_ids={int(x["id"]) for x in all_lines}
+    if any(i not in line_ids for i in requested):raise HTTPException(400,"A selected item does not belong to this invoice")
+    active={int(x[0]) for x in conn.execute("SELECT ri.sale_item_id FROM sale_return_items ri JOIN sale_returns r ON r.id=ri.return_id WHERE r.status='posted' AND ri.active=1 AND ri.sale_item_id IN (SELECT id FROM sale_items WHERE sale_id=?)",(sale_id,)).fetchall()}
+    allocations=_round_off_allocations(conn,sale_id);selected=set(requested);lines=[];taxable=gst=round_off=total=cost=0
+    for raw in all_lines:
+        line=dict(raw);line_id=int(line["id"]);already=line_id in active;returnable=(not already and line["item_status"]=="sold")
+        ro=int(allocations.get(line_id,0));line_total=int(line["line_total_paise"] or 0)+ro
+        if line_id in selected and not returnable:raise HTTPException(409,f"Tag {line['tag_no']} is not currently returnable")
+        entry={"sale_item_id":line_id,"item_id":line["item_id"],"tag_no":line["tag_no"],"description":line["description"],"metal":line["metal"],"purity":line["purity"],"item_status":line["item_status"],"already_returned":already,"returnable":returnable,"selected":line_id in selected,"taxable":_rupees(int(line["taxable_paise"] or 0)),"gst":_rupees(int(line["gst_amount_paise"] or 0)),"round_off":_rupees(ro),"total":_rupees(line_total),"cost":_rupees(int(line["cost_amount_paise"] or 0))}
+        lines.append(entry)
+        if line_id in selected:
+            taxable+=int(line["taxable_paise"] or 0);gst+=int(line["gst_amount_paise"] or 0);round_off+=ro;total+=line_total;cost+=int(line["cost_amount_paise"] or 0)
+    cgst,sgst,igst=_split_return_gst(sale,gst)
+    customer=None
+    if sale.get("customer_id"):
+        row=conn.execute("SELECT id,code,name,phone,gstin,balance,balance_paise FROM customers WHERE id=?",(sale["customer_id"],)).fetchone();customer=dict(row) if row else None
+    return {"sale":{"id":sale["id"],"invoice_no":sale["invoice_no"],"business_date":sale.get("business_date"),"customer_id":sale.get("customer_id"),"total":_rupees(int(sale["total_paise"] or 0))},"customer":customer,"lines":lines,"selected_count":len(selected),"taxable":_rupees(taxable),"gst":_rupees(gst),"cgst":_rupees(cgst),"sgst":_rupees(sgst),"igst":_rupees(igst),"round_off":_rupees(round_off),"total":_rupees(total),"cost":_rupees(cost)}
+
+
 def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str, Any], client_ip: str | None = None) -> dict[str, Any]:
     req = str(payload.get("client_request_id") or "").strip() or None
     if req:

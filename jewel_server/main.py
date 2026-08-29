@@ -8,12 +8,12 @@ from fastapi.responses import Response
 from .backup import BackupWorker,backup_status,create_backup,list_backups,restore_backup,verify_backup
 from .db import audit,business_date,business_now,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
 from .discovery import DiscoveryResponder
-from .pdfs import invoice_pdf,label_pdf,stock_report_pdf
+from .pdfs import credit_note_pdf,invoice_pdf,label_pdf,stock_report_pdf
 from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
 from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
-from .returns import cancel_sale_return,list_returns,post_sale_return,return_detail
+from .returns import cancel_sale_return,list_returns,post_sale_return,quote_sale_return,return_detail
 from .integrity import database_integrity,day_close
-from .precision import money_paise,money_sum
+from .precision import mg_weight,money_paise,money_sum,paise_money
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
 from .tls import tls_identity
 
@@ -76,8 +76,8 @@ def change_password(p:dict=Body(...),u=Depends(current_user)):
 def dashboard(u=Depends(require('dashboard'))):
     with read_db() as c:
         today=business_date(c)
-        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_mg),0)/1000.0 gw,coalesce(sum(net_mg),0)/1000.0 nw,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
-    return {'business_date':today,'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
+        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_mg),0)/1000.0 gw,coalesce(sum(net_mg),0)/1000.0 nw,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total_paise),0) total_paise FROM sales WHERE status='posted' AND business_date=?",(today,)).fetchone();rets=c.execute("SELECT count(*) c,coalesce(sum(total_paise),0) total_paise FROM sale_returns WHERE status='posted' AND business_date=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
+    return {'business_date':today,'stock':dict(stock),'today_sales':{'c':sales['c'],'total':paise_money(int(sales['total_paise'])-int(rets['total_paise']))},'gross_sales':{'c':sales['c'],'total':paise_money(sales['total_paise'])},'today_returns':{'c':rets['c'],'total':paise_money(rets['total_paise'])},'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
 @app.get('/api/settings')
 def settings(u=Depends(current_user)):
     with read_db() as c:return {'settings':get_settings(c),'branches':rowsdict(c.execute('SELECT * FROM branches WHERE active=1 ORDER BY name').fetchall()),'counters':rowsdict(c.execute('SELECT * FROM counters WHERE active=1 ORDER BY branch_id,name').fetchall())}
@@ -232,6 +232,17 @@ def returns_list(limit:int=Query(500,le=2000),u=Depends(require('returns'))):
 @app.get('/api/returns/{rid}')
 def returns_detail(rid:int,u=Depends(require('returns'))):
     with read_db() as c:return return_detail(c,rid)
+@app.post('/api/sales/{sid}/return-quote')
+def sales_return_quote(sid:int,p:dict=Body(default={}),u=Depends(require('returns'))):
+    with read_db() as c:return quote_sale_return(c,sid,p.get('sale_item_ids'))
+@app.get('/api/returns/{rid}/credit-note.pdf')
+def return_credit_note(rid:int,u=Depends(require('returns'))):
+    with read_db() as c:
+        d=return_detail(c,rid);customer=None
+        if d['return'].get('customer_id'):
+            row=c.execute('SELECT * FROM customers WHERE id=?',(d['return']['customer_id'],)).fetchone();customer=dict(row) if row else None
+        data=credit_note_pdf(d['return'],d['items'],customer,get_settings(c));name=d['return']['return_no']
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="{name}.pdf"'})
 @app.post('/api/sales/{sid}/return')
 def sales_return(sid:int,req:Request,p:dict=Body(...),u=Depends(require('returns'))):
     with write_db() as c:return post_sale_return(c,sid,p,u,ip(req))
@@ -255,7 +266,7 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
             x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount,cost_amount_paise,gst_amount_paise) VALUES(?,?,?,0,?,0)',(pid,it['id'],it['cost_amount'],money_paise(it['cost_amount'])))
         payable=money(total-paid)
         if sid and payable:
-            row=c.execute('SELECT balance_paise FROM suppliers WHERE id=?',(sid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(payable);c.execute('UPDATE suppliers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(money(newp/100),newp,now,sid))
+            row=c.execute('SELECT balance_paise FROM suppliers WHERE id=?',(sid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(payable);c.execute('UPDATE suppliers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(paise_money(newp),newp,now,sid))
         je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,business_day,f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
         if gst:lines.append(('2110',gst,0,None,None))
         if paid:lines.append(('1000',0,paid,None,None))
@@ -299,7 +310,7 @@ def kledger_add(kid:int,p:dict=Body(...),u=Depends(require('contacts'))):
     typ=p.get('entry_type') or 'adjustment';wt=weight(p.get('weight'));amt=money(p.get('amount'))
     with write_db() as c:
         if not c.execute('SELECT id FROM karigars WHERE id=?',(kid,)).fetchone():raise HTTPException(404,'Karigar not found')
-        cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;row=c.execute('SELECT metal_balance_mg,cash_balance_paise FROM karigars WHERE id=?',(kid,)).fetchone();newmg=int(row['metal_balance_mg'] or 0)+int(round(md*1000));newp=int(row['cash_balance_paise'] or 0)+money_paise(cd);c.execute('UPDATE karigars SET metal_balance_grams=?,metal_balance_mg=?,cash_balance=?,cash_balance_paise=?,updated_at=? WHERE id=?',(newmg/1000.0,newmg,money(newp/100),newp,utcnow(),kid));return {'id':cur.lastrowid}
+        cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;row=c.execute('SELECT metal_balance_mg,cash_balance_paise FROM karigars WHERE id=?',(kid,)).fetchone();newmg=int(row['metal_balance_mg'] or 0)+int(round(md*1000));newp=int(row['cash_balance_paise'] or 0)+money_paise(cd);c.execute('UPDATE karigars SET metal_balance_grams=?,metal_balance_mg=?,cash_balance=?,cash_balance_paise=?,updated_at=? WHERE id=?',(mg_weight(newmg),newmg,paise_money(newp),newp,utcnow(),kid));return {'id':cur.lastrowid}
 
 @app.get('/api/approvals')
 def approvals(u=Depends(require('approvals'))):
@@ -412,7 +423,7 @@ def tally_reconcile(date_from:str='',date_to:str='',u=Depends(require('reports')
 @app.get('/api/reports/summary')
 def summary(date_from:str='',date_to:str='',u=Depends(require('reports'))):
     with read_db() as c:
-        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today;s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable_paise),0)/100.0 taxable,coalesce(sum(gst_paise),0)/100.0 gst,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_mg),0)/1000.0 gross_weight,coalesce(sum(net_mg),0)/1000.0 net_weight,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_mg)/1000.0 gross_weight,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash_paise),0)/100.0 cash,coalesce(sum(payment_card_paise),0)/100.0 card,coalesce(sum(payment_upi_paise),0)/100.0 upi,coalesce(sum(payment_credit_paise),0)/100.0 credit,coalesce(sum(old_gold_value_paise),0)/100.0 old_gold FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today;s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable_paise),0) taxable,coalesce(sum(gst_paise),0) gst,coalesce(sum(total_paise),0) total FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();r=c.execute("SELECT count(*) credit_notes,coalesce(sum(taxable_paise),0) taxable,coalesce(sum(gst_paise),0) gst,coalesce(sum(total_paise),0) total FROM sale_returns WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_mg),0)/1000.0 gross_weight,coalesce(sum(net_mg),0)/1000.0 net_weight,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_mg)/1000.0 gross_weight,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash_paise),0) cash,coalesce(sum(payment_card_paise),0) card,coalesce(sum(payment_upi_paise),0) upi,coalesce(sum(payment_credit_paise),0) credit,coalesce(sum(old_gold_value_paise),0) old_gold FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();refund=c.execute("SELECT coalesce(sum(refund_cash_paise),0) cash,coalesce(sum(refund_card_paise),0) card,coalesce(sum(refund_upi_paise),0) upi,coalesce(sum(refund_credit_paise),0) credit FROM sale_returns WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();gross={'invoices':s['invoices'],'taxable':paise_money(s['taxable']),'gst':paise_money(s['gst']),'total':paise_money(s['total'])};returns={'credit_notes':r['credit_notes'],'taxable':paise_money(r['taxable']),'gst':paise_money(r['gst']),'total':paise_money(r['total'])};net={'invoices':s['invoices'],'taxable':paise_money(int(s['taxable'])-int(r['taxable'])),'gst':paise_money(int(s['gst'])-int(r['gst'])),'total':paise_money(int(s['total'])-int(r['total']))};payments={'cash':paise_money(int(pay['cash'])-int(refund['cash'])),'card':paise_money(int(pay['card'])-int(refund['card'])),'upi':paise_money(int(pay['upi'])-int(refund['upi'])),'credit':paise_money(int(pay['credit'])-int(refund['credit'])),'old_gold':paise_money(pay['old_gold'])};return {'date_from':date_from,'date_to':date_to,'sales':gross,'returns':returns,'net_sales':net,'stock':dict(stock),'stock_by_metal':met,'payments':payments}
 @app.get('/api/reports/trial-balance')
 def trial(date_to:str='',u=Depends(require('reports'))):
     with read_db() as c:

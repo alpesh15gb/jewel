@@ -595,78 +595,50 @@ def validate_mappings(settings: dict[str, str], mappings: dict[str, str]) -> dic
 
 
 def backfill_queue() -> dict[str, int]:
-    counts = {"sales": 0, "sale_cogs": 0, "purchases": 0}
+    counts = {"sales": 0, "sale_cogs": 0, "returns": 0, "return_cogs": 0, "purchases": 0}
     with write_db() as conn:
         for s in conn.execute("SELECT id,status FROM sales ORDER BY id").fetchall():
-            op = "cancel" if s["status"] == "cancelled" else "create"
-            enqueue_tally(conn, "sale", s["id"], op)
-            counts["sales"] += 1
-            cost = qmoney(conn.execute("SELECT coalesce(sum(cost_amount),0) FROM sale_items WHERE sale_id=?", (s["id"],)).fetchone()[0])
-            if cost:
-                enqueue_tally(conn, "sale_cogs", s["id"], op)
-                counts["sale_cogs"] += 1
+            enqueue_tally(conn,"sale",s["id"],"create");counts["sales"]+=1
+            cost_paise=int(conn.execute("SELECT coalesce(sum(cost_amount_paise),0) FROM sale_items WHERE sale_id=?",(s["id"],)).fetchone()[0])
+            if cost_paise:enqueue_tally(conn,"sale_cogs",s["id"],"create");counts["sale_cogs"]+=1
+            if s["status"]=="cancelled":
+                enqueue_tally(conn,"sale",s["id"],"cancel")
+                if cost_paise:enqueue_tally(conn,"sale_cogs",s["id"],"cancel")
+        for r in conn.execute("SELECT id,status FROM sale_returns ORDER BY id").fetchall():
+            enqueue_tally(conn,"sale_return",r["id"],"create");counts["returns"]+=1
+            cost_paise=int(conn.execute("SELECT coalesce(sum(cost_amount_paise),0) FROM sale_return_items WHERE return_id=?",(r["id"],)).fetchone()[0])
+            if cost_paise:enqueue_tally(conn,"sale_return_cogs",r["id"],"create");counts["return_cogs"]+=1
+            if r["status"]=="cancelled":
+                enqueue_tally(conn,"sale_return",r["id"],"cancel")
+                if cost_paise:enqueue_tally(conn,"sale_return_cogs",r["id"],"cancel")
         for p in conn.execute("SELECT id FROM purchases ORDER BY id").fetchall():
-            enqueue_tally(conn, "purchase", p["id"], "create")
-            counts["purchases"] += 1
+            enqueue_tally(conn,"purchase",p["id"],"create");counts["purchases"]+=1
     return counts
 
 
 def reconcile(date_from: str, date_to: str) -> dict[str, Any]:
     with read_db() as conn:
-        settings = get_settings(conn)
-        sales = rowsdict(
-            conn.execute(
-                """SELECT s.id,s.invoice_no,s.total,s.status,s.created_at,
-                          coalesce(sum(si.cost_amount),0) cogs
-                   FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id
-                   WHERE substr(s.created_at,1,10) BETWEEN ? AND ?
-                   GROUP BY s.id ORDER BY s.id""",
-                (date_from, date_to),
-            ).fetchall()
-        )
-        purchases = rowsdict(
-            conn.execute(
-                "SELECT id,purchase_no,total,created_at FROM purchases WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id",
-                (date_from, date_to),
-            ).fetchall()
-        )
-    remote = _bridge_request(
-        settings,
-        "GET",
-        "/daybook",
-        params={"company": _setting(settings, "tally_company"), "date_from": date_from, "date_to": date_to},
-        timeout=45,
-    )
-    vouchers = remote.get("vouchers", [])
-    by_key = {(str(v.get("type") or "").lower(), str(v.get("number") or "")): v for v in vouchers}
-    expected: list[dict[str, Any]] = []
+        settings=get_settings(conn)
+        sales=rowsdict(conn.execute("""SELECT s.id,s.invoice_no,s.total,s.status,s.business_date,coalesce(sum(si.cost_amount_paise),0)/100.0 cogs FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id WHERE s.business_date BETWEEN ? AND ? GROUP BY s.id ORDER BY s.id""",(date_from,date_to)).fetchall())
+        returns=rowsdict(conn.execute("""SELECT r.id,r.return_no,r.total_paise/100.0 total,r.status,r.business_date,coalesce(sum(ri.cost_amount_paise),0)/100.0 cogs FROM sale_returns r LEFT JOIN sale_return_items ri ON ri.return_id=r.id WHERE r.business_date BETWEEN ? AND ? GROUP BY r.id ORDER BY r.id""",(date_from,date_to)).fetchall())
+        purchases=rowsdict(conn.execute("SELECT id,purchase_no,total,business_date FROM purchases WHERE business_date BETWEEN ? AND ? ORDER BY id",(date_from,date_to)).fetchall())
+    remote=_bridge_request(settings,"GET","/daybook",params={"company":_setting(settings,"tally_company"),"date_from":date_from,"date_to":date_to},timeout=45)
+    vouchers=remote.get("vouchers",[]);by_key={(str(v.get("type") or "").lower(),str(v.get("number") or "")):v for v in vouchers};expected=[]
     for s in sales:
-        if s["status"] != "posted":
-            continue
-        expected.append({"type": "Sales", "number": s["invoice_no"], "amount": float(qmoney(s["total"]))})
-        if qmoney(s["cogs"]):
-            expected.append({"type": "Journal", "number": f"{s['invoice_no']}-COGS", "amount": float(qmoney(s["cogs"]))})
-    for p in purchases:
-        expected.append({"type": "Purchase", "number": p["purchase_no"], "amount": float(qmoney(p["total"]))})
-    missing = []
-    amount_mismatches = []
+        if s["status"]!="posted":continue
+        expected.append({"type":"Sales","number":s["invoice_no"],"amount":float(qmoney(s["total"]))})
+        if qmoney(s["cogs"]):expected.append({"type":"Journal","number":f"{s['invoice_no']}-COGS","amount":float(qmoney(s["cogs"]))})
+    for r in returns:
+        if r["status"]!="posted":continue
+        expected.append({"type":"Credit Note","number":r["return_no"],"amount":float(qmoney(r["total"]))})
+        if qmoney(r["cogs"]):expected.append({"type":"Journal","number":f"{r['return_no']}-COGS","amount":float(qmoney(r["cogs"]))})
+    for p in purchases:expected.append({"type":"Purchase","number":p["purchase_no"],"amount":float(qmoney(p["total"]))})
+    missing=[];amount_mismatches=[]
     for e in expected:
-        r = by_key.get((e["type"].lower(), e["number"]))
-        if not r:
-            missing.append(e)
-            continue
-        if r.get("amount") is not None and abs(float(r["amount"]) - e["amount"]) > 0.05:
-            amount_mismatches.append({"expected": e, "tally": r})
-    return {
-        "date_from": date_from,
-        "date_to": date_to,
-        "expected_count": len(expected),
-        "found_count": len(expected) - len(missing),
-        "missing": missing,
-        "amount_mismatches": amount_mismatches,
-        "tally_voucher_count": len(vouchers),
-        "ok": not missing and not amount_mismatches,
-    }
+        r=by_key.get((e["type"].lower(),e["number"]))
+        if not r:missing.append(e);continue
+        if r.get("amount") is not None and abs(abs(float(r["amount"]))-abs(e["amount"]))>0.05:amount_mismatches.append({"expected":e,"tally":r})
+    return {"date_from":date_from,"date_to":date_to,"expected_count":len(expected),"found_count":len(expected)-len(missing),"missing":missing,"amount_mismatches":amount_mismatches,"tally_voucher_count":len(vouchers),"ok":not missing and not amount_mismatches}
 
 
 class TallySyncWorker(threading.Thread):
