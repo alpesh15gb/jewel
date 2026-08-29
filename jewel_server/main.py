@@ -72,10 +72,10 @@ def change_password(p:dict=Body(...),u=Depends(current_user)):
 
 @app.get('/api/dashboard')
 def dashboard(u=Depends(require('dashboard'))):
-    today=dt.date.today().isoformat()
     with read_db() as c:
-        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_weight),0) gw,coalesce(sum(net_weight),0) nw,coalesce(sum(cost_amount),0) cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total),0) total FROM sales WHERE status='posted' AND substr(created_at,1,10)=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
-    return {'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
+        today=business_date(c)
+        stock=c.execute("SELECT count(*) c,coalesce(sum(gross_mg),0)/1000.0 gw,coalesce(sum(net_mg),0)/1000.0 nw,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();sales=c.execute("SELECT count(*) c,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date=?",(today,)).fetchone();rep=c.execute("SELECT count(*) FROM repairs WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];orders=c.execute("SELECT count(*) FROM orders WHERE status NOT IN ('delivered','cancelled')").fetchone()[0];cats=rowsdict(c.execute("SELECT category,count(*) c FROM items WHERE status='in_stock' GROUP BY category ORDER BY c DESC LIMIT 6").fetchall());rates=rowsdict(c.execute("SELECT r.metal,r.purity,r.rate_per_gram,r.effective_at FROM metal_rates r JOIN (SELECT metal,purity,max(id) id FROM metal_rates GROUP BY metal,purity) x ON x.id=r.id ORDER BY r.metal,r.purity").fetchall())
+    return {'business_date':today,'stock':dict(stock),'today_sales':dict(sales),'pending_repairs':rep,'pending_orders':orders,'categories':cats,'rates':rates}
 @app.get('/api/settings')
 def settings(u=Depends(current_user)):
     with read_db() as c:return {'settings':get_settings(c),'branches':rowsdict(c.execute('SELECT * FROM branches WHERE active=1 ORDER BY name').fetchall()),'counters':rowsdict(c.execute('SELECT * FROM counters WHERE active=1 ORDER BY branch_id,name').fetchall())}
@@ -390,16 +390,17 @@ def tally_retry(qid:int,u=Depends(require('reports'))):
     return {'ok':True}
 @app.get('/api/tally/reconcile')
 def tally_reconcile(date_from:str='',date_to:str='',u=Depends(require('reports'))):
-    date_from=date_from or dt.date.today().replace(day=1).isoformat();date_to=date_to or dt.date.today().isoformat();return reconcile(date_from,date_to)
+    with read_db() as c:today=business_date(c)
+    date_from=date_from or today[:8]+'01';date_to=date_to or today;return reconcile(date_from,date_to)
 
 @app.get('/api/reports/summary')
 def summary(date_from:str='',date_to:str='',u=Depends(require('reports'))):
-    date_from=date_from or dt.date.today().replace(day=1).isoformat();date_to=date_to or dt.date.today().isoformat()
-    with read_db() as c:s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable_paise),0)/100.0 taxable,coalesce(sum(gst_paise),0)/100.0 gst,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_mg),0)/1000.0 gross_weight,coalesce(sum(net_mg),0)/1000.0 net_weight,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_mg)/1000.0 gross_weight,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash_paise),0)/100.0 cash,coalesce(sum(payment_card_paise),0)/100.0 card,coalesce(sum(payment_upi_paise),0)/100.0 upi,coalesce(sum(payment_credit_paise),0)/100.0 credit,coalesce(sum(old_gold_value_paise),0)/100.0 old_gold FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
+    with read_db() as c:
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today;s=c.execute("SELECT count(*) invoices,coalesce(sum(taxable_paise),0)/100.0 taxable,coalesce(sum(gst_paise),0)/100.0 gst,coalesce(sum(total_paise),0)/100.0 total FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();stock=c.execute("SELECT count(*) pieces,coalesce(sum(gross_mg),0)/1000.0 gross_weight,coalesce(sum(net_mg),0)/1000.0 net_weight,coalesce(sum(cost_amount_paise),0)/100.0 cost FROM items WHERE status='in_stock'").fetchone();met=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(gross_mg)/1000.0 gross_weight,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity ORDER BY metal,purity").fetchall());pay=c.execute("SELECT coalesce(sum(payment_cash_paise),0)/100.0 cash,coalesce(sum(payment_card_paise),0)/100.0 card,coalesce(sum(payment_upi_paise),0)/100.0 upi,coalesce(sum(payment_credit_paise),0)/100.0 credit,coalesce(sum(old_gold_value_paise),0)/100.0 old_gold FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone();return {'date_from':date_from,'date_to':date_to,'sales':dict(s),'stock':dict(stock),'stock_by_metal':met,'payments':dict(pay)}
 @app.get('/api/reports/trial-balance')
 def trial(date_to:str='',u=Depends(require('reports'))):
-    date_to=date_to or dt.date.today().isoformat()
-    with read_db() as c:return rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit_paise),0)/100.0 debit,coalesce(sum(x.credit_paise),0)/100.0 credit,coalesce(sum(x.debit_paise-x.credit_paise),0)/100.0 balance FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code,a.name,a.account_type ORDER BY a.code",(date_to,)).fetchall())
+    with read_db() as c:
+        date_to=date_to or business_date(c);return rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit_paise),0)/100.0 debit,coalesce(sum(x.credit_paise),0)/100.0 credit,coalesce(sum(x.debit_paise-x.credit_paise),0)/100.0 balance FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code,a.name,a.account_type ORDER BY a.code",(date_to,)).fetchall())
 @app.get('/api/reports/ledger/{code}')
 def ledger(code:str,date_from:str='',date_to:str='',u=Depends(require('reports'))):
     with read_db() as c:return rowsdict(c.execute('SELECT je.entry_no,je.entry_date,je.memo,je.ref_type,je.ref_id,jl.debit_paise/100.0 debit,jl.credit_paise/100.0 credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE jl.account_code=? AND je.entry_date BETWEEN ? AND ? ORDER BY je.entry_date,je.id',(code,date_from or '0001-01-01',date_to or '9999-12-31')).fetchall())
@@ -414,10 +415,11 @@ def integrity_report(u=Depends(require('reports'))):
 
 @app.get('/api/reports/day-close')
 def day_close_report(date:str='',u=Depends(require('reports'))):
-    business_date=date or dt.date.today().isoformat()
-    try:dt.date.fromisoformat(business_date)
-    except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
-    with read_db() as c:return day_close(c,business_date)
+    with read_db() as c:
+        report_date=date or business_date(c)
+        try:dt.date.fromisoformat(report_date)
+        except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
+        return day_close(c,report_date)
 
 
 @app.get('/api/backups')
