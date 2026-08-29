@@ -5,14 +5,18 @@ from typing import Any
 import uvicorn
 from fastapi import Body,Depends,FastAPI,HTTPException,Query,Request
 from fastapi.responses import Response
-from .backup import BackupWorker,create_backup,list_backups,restore_backup
+from .backup import BackupWorker,backup_status,create_backup,list_backups,restore_backup,verify_backup
 from .db import audit,get_settings,init_db,next_sequence,read_db,rowdict,rowsdict,set_setting,utcnow,write_db
 from .discovery import DiscoveryResponder
 from .pdfs import invoice_pdf,label_pdf,stock_report_pdf
-from .security import create_session,current_user,hash_password,require,verify_password
+from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
 from .services import cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
+from .integrity import database_integrity,day_close
+from .precision import money_sum
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
 
+PRODUCTION_HARDENED_V1 = True
+APP_VERSION='1.1.0-rc1'
 backup_worker=None;discovery=None;tally_worker=None
 @asynccontextmanager
 async def lifespan(app):
@@ -21,20 +25,34 @@ async def lifespan(app):
     if backup_worker:backup_worker.stop()
     if tally_worker:tally_worker.stop()
     if discovery:discovery.stop()
-app=FastAPI(title='JewelLAN Server',version='1.0.0',lifespan=lifespan,docs_url='/api/docs',redoc_url=None)
+app=FastAPI(title='JewelLAN Server',version=APP_VERSION,lifespan=lifespan,docs_url='/api/docs' if os.environ.get('JEWELLAN_ENABLE_DOCS')=='1' else None,redoc_url=None)
 def ip(req):return req.client.host if req.client else 'unknown'
 
 @app.get('/api/health')
 def health():
-    with read_db() as c:c.execute('SELECT 1');s=get_settings(c)
-    return {'ok':True,'product':'JewelLAN','version':'1.0.0','business':s.get('business_name','Jewellery Store'),'time':utcnow()}
+    with read_db() as c:
+        quick=str(c.execute('PRAGMA quick_check(1)').fetchone()[0]);s=get_settings(c)
+    return {'ok':quick.lower()=='ok','product':'JewelLAN','version':APP_VERSION,'business':s.get('business_name','Jewellery Store'),'time':utcnow(),'database':{'quick_check':quick},'backup':backup_status()}
+
+
 @app.post('/api/auth/login')
 def login(req:Request,p:dict=Body(...)):
-    with read_db() as c:u=c.execute('SELECT * FROM users WHERE username=? COLLATE NOCASE',(str(p.get('username') or '').strip(),)).fetchone()
-    if not u or not u['active'] or not verify_password(str(p.get('password') or ''),u['password_hash']):raise HTTPException(401,'Invalid username or password')
+    username=str(p.get('username') or '').strip();password=str(p.get('password') or '');client=ip(req)
+    wait=login_lock_seconds(username,client)
+    if wait:raise HTTPException(429,f'Too many failed sign-in attempts. Try again in {wait} seconds.',headers={'Retry-After':str(wait)})
+    with read_db() as c:u=c.execute('SELECT * FROM users WHERE username=? COLLATE NOCASE',(username,)).fetchone()
+    valid=bool(u and u['active'] and verify_password(password,u['password_hash']))
+    if not valid:
+        locked=record_login_failure(username,client)
+        with write_db() as c:audit(c,u['id'] if u else None,'login_failed','user',u['id'] if u else username,{'username':username,'locked_seconds':locked},client)
+        raise HTTPException(401,'Invalid username or password')
+    clear_login_failures(username,client)
+    if password_needs_rehash(u['password_hash']):
+        with write_db() as c:c.execute('UPDATE users SET password_hash=?,updated_at=? WHERE id=?',(hash_password(password),utcnow(),u['id']))
     token=create_session(u['id'],str(p.get('client_name') or 'Windows Client'))
-    with write_db() as c:audit(c,u['id'],'login','user',u['id'],None,ip(req))
+    with write_db() as c:audit(c,u['id'],'login','user',u['id'],None,client)
     return {'token':token,'user':{k:u[k] for k in ('id','username','full_name','role','must_change_password')}}
+
 @app.post('/api/auth/logout')
 def logout(u=Depends(current_user)):
     with write_db() as c:c.execute('DELETE FROM sessions WHERE token_hash=?',(u['token_hash'],))
@@ -44,11 +62,12 @@ def me(u=Depends(current_user)):return {k:u[k] for k in ('id','username','full_n
 @app.post('/api/auth/change-password')
 def change_password(p:dict=Body(...),u=Depends(current_user)):
     new=str(p.get('new_password') or '')
-    if len(new)<8:raise HTTPException(400,'New password must be at least 8 characters')
+    if len(new)<10:raise HTTPException(400,'New password must be at least 10 characters')
+    if new=='Jewel@123':raise HTTPException(400,'Choose a password different from the initial password')
     with write_db() as c:
         r=c.execute('SELECT password_hash FROM users WHERE id=?',(u['id'],)).fetchone()
         if not r or not verify_password(str(p.get('old_password') or ''),r[0]):raise HTTPException(400,'Current password is incorrect')
-        c.execute('UPDATE users SET password_hash=?,must_change_password=0,updated_at=? WHERE id=?',(hash_password(new),utcnow(),u['id']));audit(c,u['id'],'change_password','user',u['id'])
+        c.execute('UPDATE users SET password_hash=?,must_change_password=0,updated_at=? WHERE id=?',(hash_password(new),utcnow(),u['id']));c.execute('DELETE FROM sessions WHERE user_id=? AND token_hash<>?',(u['id'],u['token_hash']));audit(c,u['id'],'change_password','user',u['id'])
     return {'ok':True}
 
 @app.get('/api/dashboard')
@@ -74,7 +93,7 @@ def users(u=Depends(require('*'))):
 @app.post('/api/users')
 def add_user(p:dict=Body(...),u=Depends(require('*'))):
     username=str(p.get('username') or '').strip();password=str(p.get('password') or '');role=str(p.get('role') or 'cashier')
-    if not username or len(password)<8 or role not in {'admin','manager','cashier','inventory','accounts'}:raise HTTPException(400,'Valid username, role and 8+ character password required')
+    if not username or len(password)<10 or role not in VALID_ROLES:raise HTTPException(400,'Valid username, role and 10+ character temporary password required')
     with write_db() as c:
         try:cur=c.execute('INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)',(username,hash_password(password),p.get('full_name') or username,role,utcnow(),utcnow()))
         except Exception as e:raise HTTPException(409,f'Could not create user: {e}')
@@ -84,11 +103,20 @@ def edit_user(uid:int,p:dict=Body(...),u=Depends(require('*'))):
     with write_db() as c:
         r=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
         if not r:raise HTTPException(404,'User not found')
+        role=str(p.get('role',r['role']))
+        if role not in VALID_ROLES:raise HTTPException(400,'Invalid role')
         active=1 if p.get('active',bool(r['active'])) else 0
         if uid==u['id'] and not active:raise HTTPException(400,'Cannot deactivate yourself')
-        c.execute('UPDATE users SET full_name=?,role=?,active=?,updated_at=? WHERE id=?',(p.get('full_name',r['full_name']),p.get('role',r['role']),active,utcnow(),uid))
-        if p.get('password'):c.execute('UPDATE users SET password_hash=?,must_change_password=1,updated_at=? WHERE id=?',(hash_password(str(p['password'])),utcnow(),uid))
-        audit(c,u['id'],'update','user',uid,p)
+        if uid==u['id'] and role!=r['role']:raise HTTPException(400,'Cannot change your own role')
+        if r['role']=='admin' and (role!='admin' or not active):
+            admins=c.execute("SELECT count(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+            if admins<=1:raise HTTPException(400,'Cannot remove or deactivate the last active administrator')
+        c.execute('UPDATE users SET full_name=?,role=?,active=?,updated_at=? WHERE id=?',(p.get('full_name',r['full_name']),role,active,utcnow(),uid))
+        if p.get('password'):
+            if len(str(p['password']))<10:raise HTTPException(400,'Temporary password must be at least 10 characters')
+            c.execute('UPDATE users SET password_hash=?,must_change_password=1,updated_at=? WHERE id=?',(hash_password(str(p['password'])),utcnow(),uid))
+        if role!=r['role'] or active!=r['active'] or p.get('password'):c.execute('DELETE FROM sessions WHERE user_id=?',(uid,))
+        audit(c,u['id'],'update','user',uid,{k:('***' if k=='password' else v) for k,v in p.items()})
     return {'ok':True}
 
 @app.get('/api/rates')
@@ -96,7 +124,7 @@ def rates(u=Depends(current_user)):
     with read_db() as c:return rowsdict(c.execute('SELECT * FROM metal_rates ORDER BY effective_at DESC,id DESC LIMIT 100').fetchall())
 @app.post('/api/rates')
 def add_rate(p:dict=Body(...),u=Depends(require('rates'))):
-    rate=float(p.get('rate_per_gram') or 0)
+    rate=money(p.get('rate_per_gram'))
     if rate<=0:raise HTTPException(400,'Rate must be positive')
     with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by) VALUES(?,?,?,?,?)',(p.get('metal') or 'Gold',p.get('purity') or '916',rate,p.get('effective_at') or utcnow(),u['id']));audit(c,u['id'],'create','metal_rate',cur.lastrowid,p);return {'id':cur.lastrowid}
 
@@ -126,10 +154,10 @@ def item(iid:int,u=Depends(require('inventory.read'))):
         return {'item':dict(r),'movements':rowsdict(c.execute('SELECT * FROM stock_movements WHERE item_id=? ORDER BY id DESC LIMIT 100',(iid,)).fetchall())}
 @app.post('/api/items')
 def add_item(req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
-    with write_db() as c:return create_item(c,p,u['id'],ip(req))
+    with write_db() as c:return create_item(c,p,u,ip(req))
 @app.put('/api/items/{iid}')
 def edit_item(iid:int,req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
-    with write_db() as c:return update_item(c,iid,p,u['id'],ip(req))
+    with write_db() as c:return update_item(c,iid,p,u,ip(req))
 @app.post('/api/items/{iid}/transfer')
 def move_item(iid:int,req:Request,p:dict=Body(...),u=Depends(require('inventory.write'))):
     with write_db() as c:return transfer_item(c,iid,int(p.get('branch_id') or 1),p.get('counter_id'),u['id'],str(p.get('note') or ''),ip(req))
@@ -168,7 +196,7 @@ def karigar_add(p:dict=Body(...),u=Depends(require('contacts'))):
 
 @app.post('/api/sales/quote')
 def sales_quote(p:dict=Body(...),u=Depends(require('sales'))):
-    with read_db() as c:return quote_sale(c,p.get('lines') or [],float(p.get('discount',0) or 0),sum(float(x.get('value',0) or 0) for x in p.get('old_gold') or []))
+    with read_db() as c:return quote_sale(c,p.get('lines') or [],p.get('discount',0),money_sum(x.get('value',0) for x in p.get('old_gold') or []))
 @app.post('/api/sales')
 def sale(req:Request,p:dict=Body(...),u=Depends(require('sales'))):
     with write_db() as c:return post_sale(c,p,u,ip(req))
@@ -205,11 +233,11 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
             if old:return dict(old)|{'idempotent':True}
         its=p.get('items') or []
         if not its:raise HTTPException(400,'Purchase must have at least one item')
-        no=next_sequence(c,'purchase','PUR-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);sub=money(sum(float(x.get('cost_amount',0) or 0) for x in its));gst=money(p.get('gst'));total=money(sub+gst);paid=money(p.get('paid'))
+        no=next_sequence(c,'purchase','PUR-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);sub=money_sum(x.get('cost_amount',0) for x in its);gst=money(p.get('gst'));total=money(sub+gst);paid=money(p.get('paid'))
         if paid<0 or paid>total+.01:raise HTTPException(400,'Paid amount cannot exceed purchase total')
         cur=c.execute('INSERT INTO purchases(purchase_no,client_request_id,supplier_id,branch_id,subtotal,gst,total,paid,notes,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(no,req,sid,bid,sub,gst,total,paid,p.get('notes'),u['id'],now));pid=cur.lastrowid
         for x in its:
-            x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u['id']);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount) VALUES(?,?,?,0)',(pid,it['id'],it['cost_amount']))
+            x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount) VALUES(?,?,?,0)',(pid,it['id'],it['cost_amount']))
         payable=money(total-paid)
         if sid and payable:c.execute('UPDATE suppliers SET balance=balance+?,updated_at=? WHERE id=?',(payable,now,sid))
         je=next_sequence(c,'journal','JE',7);j=c.execute('INSERT INTO journal_entries(entry_no,entry_date,memo,ref_type,ref_id,user_id,created_at) VALUES(?,?,?,?,?,?,?)',(je,dt.date.today().isoformat(),f'Purchase {no}','purchase',pid,u['id'],now)).lastrowid;lines=[('1200',sub,0,None,None)]
@@ -229,7 +257,7 @@ def wf_list(table):
 def repairs(u=Depends(require('repairs'))):return wf_list('repairs')
 @app.post('/api/repairs')
 def repair_add(p:dict=Body(...),u=Depends(require('repairs'))):
-    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),float(p.get('gross_weight',0) or 0),p.get('received_on') or dt.date.today().isoformat(),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
+    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),weight(p.get('gross_weight',0)),p.get('received_on') or dt.date.today().isoformat(),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
 @app.put('/api/repairs/{rid}')
 def repair_edit(rid:int,p:dict=Body(...),u=Depends(require('repairs'))):
     with write_db() as c:r=c.execute('SELECT * FROM repairs WHERE id=?',(rid,)).fetchone();
@@ -239,7 +267,7 @@ def repair_edit(rid:int,p:dict=Body(...),u=Depends(require('repairs'))):
 def orders(u=Depends(require('orders'))):return wf_list('orders')
 @app.post('/api/orders')
 def order_add(p:dict=Body(...),u=Depends(require('orders'))):
-    with write_db() as c:no=next_sequence(c,'order','ORD-',6);now=utcnow();cur=c.execute('INSERT INTO orders(order_no,customer_id,description,metal,purity,target_weight,karigar_id,status,estimated_amount,advance,due_date,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('description') or 'Custom jewellery',p.get('metal') or 'Gold',p.get('purity') or '916',float(p.get('target_weight',0) or 0),p.get('karigar_id'),p.get('status') or 'new',money(p.get('estimated_amount')),money(p.get('advance')),p.get('due_date'),p.get('notes'),u['id'],now,now));return {'id':cur.lastrowid,'order_no':no}
+    with write_db() as c:no=next_sequence(c,'order','ORD-',6);now=utcnow();cur=c.execute('INSERT INTO orders(order_no,customer_id,description,metal,purity,target_weight,karigar_id,status,estimated_amount,advance,due_date,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('description') or 'Custom jewellery',p.get('metal') or 'Gold',p.get('purity') or '916',weight(p.get('target_weight',0)),p.get('karigar_id'),p.get('status') or 'new',money(p.get('estimated_amount')),money(p.get('advance')),p.get('due_date'),p.get('notes'),u['id'],now,now));return {'id':cur.lastrowid,'order_no':no}
 @app.put('/api/orders/{oid}')
 def order_edit(oid:int,p:dict=Body(...),u=Depends(require('orders'))):
     with read_db() as c:r=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
@@ -378,11 +406,24 @@ def ledger(code:str,date_from:str='',date_to:str='',u=Depends(require('reports')
 def stock_pdf(u=Depends(require('reports'))):
     with read_db() as c:data=stock_report_pdf(rowsdict(c.execute("SELECT * FROM items WHERE status='in_stock' ORDER BY category,tag_no").fetchall()),get_settings(c))
     return Response(data,media_type='application/pdf',headers={'Content-Disposition':'inline; filename="stock-report.pdf"'})
+@app.get('/api/integrity')
+def integrity_report(u=Depends(require('reports'))):
+    with read_db() as c:return database_integrity(c)
+
+
+@app.get('/api/reports/day-close')
+def day_close_report(date:str='',u=Depends(require('reports'))):
+    business_date=date or dt.date.today().isoformat()
+    try:dt.date.fromisoformat(business_date)
+    except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
+    with read_db() as c:return day_close(c,business_date)
+
+
 @app.get('/api/backups')
 def backups(u=Depends(require('backup'))):return list_backups()
 @app.post('/api/backups')
 def backup(p:dict=Body(default={}),u=Depends(require('backup'))):
-    f=create_backup(str(p.get('label') or 'manual'));return {'ok':True,'name':f.name,'size':f.stat().st_size}
+    f=create_backup(str(p.get('label') or 'manual'));v=verify_backup(f);return {'ok':True,'name':f.name,'size':f.stat().st_size,'sha256':v['sha256'],'verified':v['ok']}
 @app.get('/api/audit-log')
 def logs(limit:int=Query(200,le=1000),u=Depends(require('*'))):
     with read_db() as c:return rowsdict(c.execute('SELECT l.*,u.username FROM audit_log l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT ?',(limit,)).fetchall())
@@ -392,6 +433,6 @@ def lan_addresses(port):
     except:return []
 def cli():
     p=argparse.ArgumentParser(description='JewelLAN offline jewellery ERP server');p.add_argument('--host',default=os.environ.get('JEWELLAN_HOST','0.0.0.0'));p.add_argument('--port',type=int,default=int(os.environ.get('JEWELLAN_PORT','8765')));p.add_argument('--restore');a=p.parse_args()
-    if a.restore:init_db(hash_password);restore_backup(a.restore);print('Backup restored.');return
-    os.environ['JEWELLAN_PORT']=str(a.port);print('\nJewelLAN Server - OFFLINE LAN MODE');print('Local:',f'http://127.0.0.1:{a.port}');[print('LAN:  ',x) for x in lan_addresses(a.port)];print('Default first login: admin / Jewel@123 (change it immediately)\n');uvicorn.run(app,host=a.host,port=a.port,log_level='info',access_log=False)
+    if a.restore:init_db(hash_password);result=restore_backup(a.restore);init_db(hash_password);print('Backup restored and migrated:',result);return
+    os.environ['JEWELLAN_PORT']=str(a.port);print('\nJewelLAN Server - OFFLINE LAN MODE');print('Local:',f'http://127.0.0.1:{a.port}');[print('LAN:  ',x) for x in lan_addresses(a.port)];print('Default first login: admin / Jewel@123 (change it immediately; new passwords require 10+ characters)\n');uvicorn.run(app,host=a.host,port=a.port,log_level='info',access_log=False)
 if __name__=='__main__':cli()

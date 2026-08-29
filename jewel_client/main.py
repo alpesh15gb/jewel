@@ -16,6 +16,7 @@ from .scale import read_scale
 from .ui_theme import PALETTE, apply_theme, card, divider, status_pill
 
 APP_TITLE = "JewelLAN Jewellery ERP"
+PRODUCTION_HARDENED_V1 = True
 
 
 def money(v: Any) -> str:
@@ -290,7 +291,7 @@ class DashboardPage(Page):
 
 class InventoryPage(Page):
     COLS = ("tag_no","name","metal","purity","gross_weight","net_weight","huid","status","cost_amount")
-    FIELDS = [("name","Item name"),("category","Category"),("metal","Metal",["Gold","Silver","Platinum","Other"]),("purity","Purity",["999","995","958","925","916","875","833","750","585","417"]),("gross_weight","Gross weight"),("stone_weight","Stone weight"),("net_weight","Net weight"),("stone_value","Stone value"),("cost_amount","Cost amount"),("making_type","Making type",["per_gram","percent","fixed"]),("making_value","Making value"),("wastage_percent","Wastage %"),("huid","HUID"),("certificate_no","Certificate"),("barcode","Barcode (blank=tag)"),("rfid_epc","RFID EPC")]
+    FIELDS = [("name","Item name"),("category","Category"),("metal","Metal",["Gold","Silver","Platinum","Other"]),("purity","Purity",["999","995","958","925","916","875","833","750","585","417"]),("gross_weight","Gross weight (g)"),("stone_weight","Stone weight (g)"),("net_weight","Net weight (auto = gross - stone)"),("stone_value","Stone value"),("cost_amount","Cost amount"),("making_type","Making type",["per_gram","percent","fixed"]),("making_value","Making value"),("wastage_percent","Wastage %"),("huid","HUID (6 alphanumeric)"),("certificate_no","Certificate"),("barcode","Barcode (blank=tag)"),("rfid_epc","RFID EPC")]
     def __init__(self,parent,app):
         super().__init__(parent,app); self.heading("Inventory & Tagging", "Serialized jewellery with barcode, HUID, weights and movement-safe status.")
         bar=ttk.Frame(self);bar.pack(fill="x");self.q=tk.StringVar();e=ttk.Entry(bar,textvariable=self.q);e.pack(side="left",fill="x",expand=True);e.bind("<Return>",lambda _:self.refresh());ttk.Button(bar,text="Search",command=self.refresh).pack(side="left",padx=4);ttk.Button(bar,text="Add",command=self.add).pack(side="left");ttk.Button(bar,text="Edit",command=self.edit).pack(side="left",padx=4);ttk.Button(bar,text="Print tag",command=self.print_tag).pack(side="left")
@@ -301,12 +302,32 @@ class InventoryPage(Page):
         self.t.delete(*self.t.get_children());[self.t.insert("","end",iid=str(x["id"]),values=tuple(x.get(c,"") for c in self.COLS)) for x in r]
     def selected(self): return int(self.t.selection()[0]) if self.t.selection() else None
     def values(self, defaults=None):
-        d=form_dialog(self,"Jewellery item",self.FIELDS,defaults or {"metal":"Gold","purity":"916","making_type":"per_gram","category":"Ring"})
+        original=defaults or {}
+        d=form_dialog(self,"Jewellery item",self.FIELDS,original or {"metal":"Gold","purity":"916","making_type":"per_gram","category":"Ring"})
         if not d:return None
         for k in ("gross_weight","stone_weight","net_weight","stone_value","cost_amount","making_value","wastage_percent"):
             try:d[k]=float(d.get(k) or 0)
             except ValueError:raise RuntimeError(f"{k} must be numeric")
+        if d['stone_weight']>d['gross_weight']+0.0005:raise RuntimeError('Stone weight cannot exceed gross weight')
+        expected=round(d['gross_weight']-d['stone_weight']+1e-12,3);entered=round(d['net_weight'],3)
+        unchanged_existing_override=bool(original.get('net_weight_override_reason')) and all(abs(float(d.get(k) or 0)-float(original.get(k) or 0))<=0.001 for k in ('gross_weight','stone_weight','net_weight')) and str(d.get('purity'))==str(original.get('purity'))
+        if unchanged_existing_override:
+            d['net_weight_override_reason']=original.get('net_weight_override_reason')
+        elif abs(entered-expected)>0.001:
+            if self.app.user.get('role') in ('admin','manager'):
+                use_override=messagebox.askyesno('Net weight differs',f'Gross − stone is {expected:.3f} g but you entered {entered:.3f} g.\n\nUse a manager override instead of auto-correcting?',parent=self)
+                if use_override:
+                    reason=simpledialog.askstring('Net weight override','Enter the reason for overriding calculated net weight:',parent=self)
+                    if not reason or len(reason.strip())<3:raise RuntimeError('A reason is required for a net-weight override')
+                    d['allow_net_weight_override']=True;d['net_weight_override_reason']=reason.strip();d['net_weight']=entered
+                else:d['net_weight']=expected
+            else:
+                messagebox.showwarning('Net weight corrected',f'Net weight has been set to Gross − Stone = {expected:.3f} g.',parent=self);d['net_weight']=expected
+        else:d['net_weight']=expected
+        huid=str(d.get('huid') or '').strip().upper();d['huid']=huid
+        if huid and (len(huid)!=6 or not huid.isalnum()):raise RuntimeError('HUID must be exactly six letters/numbers, for example ABC123')
         d["branch_id"]=int(self.app.cfg.get("branch_id",1));d["counter_id"]=self.app.cfg.get("counter_id") or None;return d
+
     def add(self):
         try:
             d=self.values();

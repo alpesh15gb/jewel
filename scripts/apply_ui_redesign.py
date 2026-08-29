@@ -5,6 +5,10 @@ from pathlib import Path
 PATH = Path("jewel_client/main.py")
 text = PATH.read_text(encoding="utf-8")
 
+if "PRODUCTION_HARDENED_V1 = True" in text:
+    print("Professional UI redesign already incorporated in production-hardened source.")
+    raise SystemExit(0)
+
 
 def between(src: str, start: str, end: str, replacement: str) -> str:
     a = src.find(start)
