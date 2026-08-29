@@ -19,38 +19,27 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Repair known client runtime defect
+      - name: Apply source upgrade guards
         shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-          p = Path('jewel_client/main.py')
-          text = p.read_text(encoding='utf-8')
-          bad = 'command=root.destroy).pack(fill="x", pady=2)'
-          good = 'command=self.root.destroy).pack(fill="x", pady=2)'
-          if bad in text:
-              p.write_text(text.replace(bad, good, 1), encoding='utf-8')
-              print('Repaired undefined root reference in App.build')
-          else:
-              print('Known client runtime defect is already repaired.')
-          '@ | python -
+          python scripts/apply_tally_upgrade.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile every Python source file
         shell: pwsh
         run: |
-          python -m compileall -q jewel_client jewel_server run_client.py run_server.py tests
+          python -m compileall -q jewel_client jewel_server jewel_tally_bridge run_client.py run_server.py run_tally_bridge.py tests scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Persist source repairs to main
+      - name: Persist generated source upgrade to main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
-          if (-not (git diff --quiet -- jewel_client/main.py)) {
+          if (-not (git diff --quiet)) {
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add jewel_client/main.py
-            git commit -m "Fix JewelPOS post-login root reference"
+            git add jewel_client jewel_server installer README.md
+            git commit -m "Apply JewelLAN TallyPrime integration upgrade"
             git push origin HEAD:main
           }
 
@@ -60,9 +49,7 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_client.api, jewel_client.config, jewel_client.scale; print(jewel_client.main.__file__)"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -c "import jewel_server.main, jewel_server.db, jewel_server.services; print(jewel_server.main.__file__)"
+          python -c "import jewel_client.main, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke test post-login GUI construction
@@ -76,33 +63,24 @@ jobs:
               base_url = 'http://127.0.0.1:8765'
               def get(self, path, **params):
                   if path == '/api/settings':
-                      return {
-                          'settings': {'business_name': 'JewelLAN CI'},
-                          'branches': [],
-                          'counters': [],
-                      }
+                      return {'settings': {'business_name': 'JewelLAN CI'}, 'branches': [], 'counters': []}
                   if path == '/api/dashboard':
-                      return {
-                          'stock': {'c': 0, 'nw': 0.0},
-                          'today_sales': {'total': 0.0},
-                          'pending_repairs': 0,
-                          'pending_orders': 0,
-                          'rates': [],
-                          'categories': [],
-                      }
+                      return {'stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
+                  if path == '/api/tally/status':
+                      return {'enabled':'0','bridge_url':'http://127.0.0.1:8767','company':'','business_state_code':'','auto_create_parties':'1','mappings':{},'queue':{},'bridge':None}
+                  if path == '/api/customers': return []
+                  if path == '/api/suppliers': return []
+                  if path == '/api/karigars': return []
+                  if path == '/api/purchases': return []
+                  if path == '/api/repairs': return []
+                  if path == '/api/orders': return []
+                  if path == '/api/rates': return []
+                  if path == '/api/users': return []
                   raise RuntimeError(f'Unexpected GUI smoke-test GET: {path}')
 
-          root = tk.Tk()
-          root.withdraw()
-          app = App(
-              root,
-              DummyApi(),
-              {'branch_id': 1, 'counter_id': 1},
-              {'full_name': 'CI Administrator', 'role': 'admin', 'must_change_password': 0},
-          )
-          root.update_idletasks()
-          assert app.winfo_exists()
-          root.destroy()
+          root = tk.Tk(); root.withdraw()
+          app = App(root, DummyApi(), {'branch_id': 1, 'counter_id': 1}, {'full_name': 'CI Administrator', 'role': 'admin', 'must_change_password': 0})
+          root.update_idletasks(); assert app.winfo_exists(); root.destroy()
           print('Post-login GUI constructed successfully.')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -118,7 +96,8 @@ jobs:
           --hidden-import jewel_server.db --hidden-import jewel_server.services
           --hidden-import jewel_server.security --hidden-import jewel_server.pdfs
           --hidden-import jewel_server.backup --hidden-import jewel_server.discovery
-          --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab
+          --hidden-import jewel_server.tally
+          --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab --collect-all requests
           run_server.py
 
       - name: Build Windows client EXE
@@ -131,15 +110,22 @@ jobs:
           --collect-all requests --collect-all reportlab --hidden-import serial
           run_client.py
 
-      - name: Self-test packaged JewelPOS executable
+      - name: Build Tally Bridge EXE
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --name JewelTallyBridge
+          --paths .
+          --hidden-import jewel_tally_bridge --hidden-import jewel_tally_bridge.main
+          --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all requests
+          run_tally_bridge.py
+
+      - name: Self-test packaged executables
         shell: pwsh
         run: |
           $p = Start-Process -FilePath .\dist\JewelPOS.exe -ArgumentList '--self-test' -PassThru
-          if (-not $p.WaitForExit(15000)) {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            throw 'JewelPOS.exe self-test did not exit; a packaging error dialog may be blocking startup.'
-          }
-          if ($p.ExitCode -ne 0) { throw "JewelPOS.exe self-test failed with exit code $($p.ExitCode)" }
+          if (-not $p.WaitForExit(15000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; throw 'JewelPOS.exe self-test did not exit.' }
+          if ($p.ExitCode -ne 0) { throw "JewelPOS.exe self-test failed: $($p.ExitCode)" }
+          $b = Start-Process -FilePath .\dist\JewelTallyBridge.exe -ArgumentList '--self-test' -PassThru -Wait
+          if ($b.ExitCode -ne 0) { throw "JewelTallyBridge.exe self-test failed: $($b.ExitCode)" }
 
       - name: Install Inno Setup compiler
         shell: pwsh
@@ -148,21 +134,13 @@ jobs:
       - name: Build JewelLAN Setup
         shell: pwsh
         run: |
-          $candidates = @(
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-          )
+          $candidates = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe")
           $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $iscc) {
-            $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
-            if ($cmd) { $iscc = $cmd.Source }
-          }
+          if (-not $iscc) { $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue; if ($cmd) { $iscc = $cmd.Source } }
           if (-not $iscc) { throw "Inno Setup compiler was not found." }
           & $iscc "installer\JewelLAN.iss"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Test-Path "dist\installer\JewelLAN-Setup.exe")) {
-            throw "JewelLAN-Setup.exe was not produced."
-          }
+          if (-not (Test-Path "dist\installer\JewelLAN-Setup.exe")) { throw "JewelLAN-Setup.exe was not produced." }
 
       - name: Make portable developer package
         shell: pwsh
@@ -170,6 +148,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/JewelLAN-Portable | Out-Null
           Copy-Item dist/JewelServer.exe dist/JewelLAN-Portable/
           Copy-Item dist/JewelPOS.exe dist/JewelLAN-Portable/
+          Copy-Item dist/JewelTallyBridge.exe dist/JewelLAN-Portable/
           Copy-Item README.md dist/JewelLAN-Portable/
           Compress-Archive -Path dist/JewelLAN-Portable/* -DestinationPath dist/JewelLAN-Portable.zip -Force
 
