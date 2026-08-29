@@ -36,7 +36,14 @@ def patch_client() -> None:
             if saved!=live:raise ApiError("The JewelLAN server certificate changed. Verify the server PC before trusting the new identity.")
         else:
             pretty=format_fingerprint(live)
-            ok=messagebox.askyesno("Trust JewelLAN server?",f"Secure server found at:\n{url}\n\nSHA-256 certificate fingerprint:\n{pretty}\n\nVerify this fingerprint on the server PC with 'JewelServer.exe --show-fingerprint'. Trust this server?",parent=self)
+            message=f"""Secure server found at:
+{url}
+
+SHA-256 certificate fingerprint:
+{pretty}
+
+Verify this fingerprint on the server PC with 'JewelServer.exe --show-fingerprint'. Trust this server?"""
+            ok=messagebox.askyesno("Trust JewelLAN server?",message,parent=self)
             if not ok:raise ApiError("Server identity was not trusted")
         self.api.trust_server(url,live);self.cfg["server_url"]=url;self.cfg["server_fingerprint"]=live;save_config(self.cfg);return live
 
@@ -94,6 +101,7 @@ def patch_installer() -> None:
     t=t.replace('; Tally Bridge is exposed only to the Private LAN; TallyPrime itself remains localhost-only.','; Tally Bridge remains loopback-only by default so its bearer token never crosses the LAN in clear text.')
     t=t.replace('Filename: "{sys}\\netsh.exe"; Parameters: "advfirewall firewall add rule name=""JewelLAN Tally Bridge TCP"" dir=in action=allow protocol=TCP localport=8767 profile=private enable=yes"; Flags: runhidden; Components: tallybridge\n','')
     t=t.replace('--host 0.0.0.0 --port 8767 --tally-url http://127.0.0.1:9000','--host 127.0.0.1 --port 8767 --tally-url http://127.0.0.1:9000')
+    t=t.replace('VersionInfoProductVersion={#MyAppVersion}','VersionInfoProductVersion={#MyFileVersion}')
     p.write_text(t,encoding='utf-8')
 
 
