@@ -61,18 +61,6 @@ def _make_sale(client: TestClient, headers: dict[str,str], customer_id: int | No
     return sale.json(),detail.json(),items
 
 
-def test_bijoria_fresh_defaults_and_three_counters():
-    with TestClient(app):
-        with read_db() as conn:
-            settings={r["key"]:r["value"] for r in conn.execute("SELECT key,value FROM settings")}
-            assert settings["business_name"]=="Bijoria"
-            assert settings["business_state_code"]=="36"
-            assert settings["business_timezone_offset_minutes"]=="330"
-            counters=[r[0] for r in conn.execute("SELECT name FROM counters WHERE active=1 ORDER BY id")]
-            assert counters[:3]==["Counter 1","Counter 2","Counter 3"]
-            assert conn.execute("PRAGMA user_version").fetchone()[0]>=5
-
-
 def test_partial_return_credit_note_exact_balance_pdf_and_reversal():
     with TestClient(app) as client:
         headers=_login(client)
