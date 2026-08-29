@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
+PRODUCTION_HARDENED_V1 = True
+LATEST_SCHEMA_VERSION = 3
 
 
 def app_data_dir() -> Path:
-    if os.name == "nt":
+    override = os.environ.get("JEWELLAN_DATA_DIR")
+    if override:
+        base = Path(override).expanduser().resolve()
+    elif os.name == "nt":
         base = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
     else:
-        base = Path(os.environ.get("JEWELLAN_DATA_DIR", Path.home() / ".jewellan"))
+        base = Path.home() / ".jewellan"
     path = base / APP_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -34,14 +39,24 @@ _WRITE_LOCK = threading.RLock()
 def utcnow() -> str: return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None, check_same_thread=False); conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON"); conn.execute("PRAGMA journal_mode=WAL"); conn.execute("PRAGMA synchronous=FULL"); conn.execute("PRAGMA busy_timeout=15000"); return conn
+    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA journal_size_limit=67108864")
+    return conn
 
 @contextlib.contextmanager
 def read_db() -> Iterator[sqlite3.Connection]:
-    conn=connect()
-    try: yield conn
-    finally: conn.close()
+    conn = connect()
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 @contextlib.contextmanager
 def write_db() -> Iterator[sqlite3.Connection]:
@@ -102,28 +117,144 @@ CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY,applie
 
 TALLY_DEFAULT_MAPPINGS={"cash":"Cash","bank":"Bank / Card / UPI","sales":"Jewellery Sales","inventory":"Jewellery Inventory","cogs":"Cost of Goods Sold","old_gold":"Old Gold Inventory","customer_receivables":"Sundry Debtors Control","supplier_payables":"Sundry Creditors Control","input_gst":"Input GST","cgst":"Output CGST 1.5%","sgst":"Output SGST 1.5%","igst":"Output IGST 3%","round_off":"Round Off"}
 
-def _migrate_schema(conn):
-    cols={r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()}
-    additions={"place_of_supply_code":"TEXT","cgst":"REAL NOT NULL DEFAULT 0","sgst":"REAL NOT NULL DEFAULT 0","igst":"REAL NOT NULL DEFAULT 0"}
-    for name,spec in additions.items():
-        if name not in cols:conn.execute(f"ALTER TABLE sales ADD COLUMN {name} {spec}")
-    conn.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?)",(utcnow(),))
+
+def _table_columns(conn, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(conn, table: str, name: str, spec: str) -> None:
+    if name not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+
+
+def _migration_1(conn) -> None:
+    for name, spec in {
+        "place_of_supply_code": "TEXT",
+        "cgst": "REAL NOT NULL DEFAULT 0",
+        "sgst": "REAL NOT NULL DEFAULT 0",
+        "igst": "REAL NOT NULL DEFAULT 0",
+    }.items():
+        _add_column_if_missing(conn, "sales", name, spec)
+
+
+def _migration_2(conn) -> None:
+    _add_column_if_missing(conn, "items", "net_weight_override_reason", "TEXT")
+    _add_column_if_missing(conn, "audit_log", "prev_hash", "TEXT")
+    _add_column_if_missing(conn, "audit_log", "entry_hash", "TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS auth_failures (identity TEXT PRIMARY KEY,fail_count INTEGER NOT NULL DEFAULT 0,"
+        "window_started TEXT NOT NULL,locked_until TEXT,updated_at TEXT NOT NULL)"
+    )
+    conn.execute("UPDATE items SET huid=upper(trim(huid)) WHERE huid IS NOT NULL AND trim(huid)<>''")
+    from .audit_chain import GENESIS_HASH, compute_audit_hash
+    prev = GENESIS_HASH
+    rows = conn.execute(
+        "SELECT id,user_id,action,entity,entity_id,details_json,client_ip,created_at FROM audit_log ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        entry_hash = compute_audit_hash(
+            prev,row["user_id"],row["action"],row["entity"],row["entity_id"],row["details_json"],row["client_ip"],row["created_at"]
+        )
+        conn.execute("UPDATE audit_log SET prev_hash=?,entry_hash=? WHERE id=?", (prev, entry_hash, row["id"]))
+        prev = entry_hash
+
+
+def _migration_3(conn) -> None:
+    statements = [
+        """CREATE TRIGGER IF NOT EXISTS items_weight_guard_insert BEFORE INSERT ON items
+        WHEN NEW.stone_weight>NEW.gross_weight+0.0005 OR NEW.net_weight<0 OR
+        (abs(NEW.net_weight-(NEW.gross_weight-NEW.stone_weight))>0.0015 AND coalesce(trim(NEW.net_weight_override_reason),'')='')
+        BEGIN SELECT RAISE(ABORT,'inconsistent jewellery weights'); END""",
+        """CREATE TRIGGER IF NOT EXISTS items_weight_guard_update BEFORE UPDATE OF gross_weight,stone_weight,net_weight,net_weight_override_reason ON items
+        WHEN NEW.stone_weight>NEW.gross_weight+0.0005 OR NEW.net_weight<0 OR
+        (abs(NEW.net_weight-(NEW.gross_weight-NEW.stone_weight))>0.0015 AND coalesce(trim(NEW.net_weight_override_reason),'')='')
+        BEGIN SELECT RAISE(ABORT,'inconsistent jewellery weights'); END""",
+        """CREATE TRIGGER IF NOT EXISTS items_huid_guard_insert BEFORE INSERT ON items
+        WHEN NEW.huid IS NOT NULL AND trim(NEW.huid)<>'' AND (length(trim(NEW.huid))<>6 OR upper(trim(NEW.huid)) GLOB '*[^A-Z0-9]*')
+        BEGIN SELECT RAISE(ABORT,'HUID must be six alphanumeric characters'); END""",
+        """CREATE TRIGGER IF NOT EXISTS items_huid_guard_update BEFORE UPDATE OF huid ON items
+        WHEN NEW.huid IS NOT NULL AND trim(NEW.huid)<>'' AND (length(trim(NEW.huid))<>6 OR upper(trim(NEW.huid)) GLOB '*[^A-Z0-9]*')
+        BEGIN SELECT RAISE(ABORT,'HUID must be six alphanumeric characters'); END""",
+        "CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT,'audit log is append-only'); END",
+        "CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT,'audit log is append-only'); END",
+        "CREATE TRIGGER IF NOT EXISTS stock_movements_no_update BEFORE UPDATE ON stock_movements BEGIN SELECT RAISE(ABORT,'stock movements are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS stock_movements_no_delete BEFORE DELETE ON stock_movements BEGIN SELECT RAISE(ABORT,'stock movements are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS sale_items_no_update BEFORE UPDATE ON sale_items BEGIN SELECT RAISE(ABORT,'posted sale lines are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS sale_items_no_delete BEFORE DELETE ON sale_items BEGIN SELECT RAISE(ABORT,'posted sale lines are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS journal_entries_no_update BEFORE UPDATE ON journal_entries BEGIN SELECT RAISE(ABORT,'journal entries are immutable; post a reversal'); END",
+        "CREATE TRIGGER IF NOT EXISTS journal_entries_no_delete BEFORE DELETE ON journal_entries BEGIN SELECT RAISE(ABORT,'journal entries are immutable; post a reversal'); END",
+        "CREATE TRIGGER IF NOT EXISTS journal_lines_no_update BEFORE UPDATE ON journal_lines BEGIN SELECT RAISE(ABORT,'journal lines are immutable; post a reversal'); END",
+        "CREATE TRIGGER IF NOT EXISTS journal_lines_no_delete BEFORE DELETE ON journal_lines BEGIN SELECT RAISE(ABORT,'journal lines are immutable; post a reversal'); END",
+        "CREATE TRIGGER IF NOT EXISTS old_gold_no_update BEFORE UPDATE ON old_gold BEGIN SELECT RAISE(ABORT,'old-gold receipt lines are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS old_gold_no_delete BEFORE DELETE ON old_gold BEGIN SELECT RAISE(ABORT,'old-gold receipt lines are immutable'); END",
+        """CREATE TRIGGER IF NOT EXISTS sales_financial_no_update BEFORE UPDATE OF invoice_no,client_request_id,branch_id,counter_id,customer_id,subtotal,discount,taxable,gst,place_of_supply_code,cgst,sgst,igst,round_off,total,payment_cash,payment_card,payment_upi,payment_credit,old_gold_value,user_id,created_at ON sales
+        BEGIN SELECT RAISE(ABORT,'posted invoice financial fields are immutable; cancel/reverse instead'); END""",
+        "CREATE TRIGGER IF NOT EXISTS purchases_no_update BEFORE UPDATE ON purchases BEGIN SELECT RAISE(ABORT,'posted purchases are immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS purchases_no_delete BEFORE DELETE ON purchases BEGIN SELECT RAISE(ABORT,'posted purchases are immutable'); END",
+        "CREATE INDEX IF NOT EXISTS idx_auth_failures_updated ON auth_failures(updated_at)",
+    ]
+    for statement in statements:
+        conn.execute(statement)
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3))
+
+
+def _migrate_schema(conn) -> None:
+    applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
+    for version, migration in MIGRATIONS:
+        if version in applied:
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migration(conn)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (version, utcnow()))
+            conn.execute(f"PRAGMA user_version={version}")
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+
+
+def _ensure_optional_indexes(conn) -> None:
+    duplicate = conn.execute(
+        "SELECT 1 FROM items WHERE huid IS NOT NULL AND trim(huid)<>'' GROUP BY upper(trim(huid)) HAVING count(*)>1 LIMIT 1"
+    ).fetchone()
+    if not duplicate:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_items_huid ON items(huid COLLATE NOCASE) "
+            "WHERE huid IS NOT NULL AND trim(huid)<>''"
+        )
 
 DEFAULT_ACCOUNTS=[("1000","Cash","asset"),("1010","Bank / Card / UPI","asset"),("1100","Customer Receivables","asset"),("1200","Jewellery Inventory","asset"),("1210","Old Gold Inventory","asset"),("2000","Supplier Payables","liability"),("2100","GST Output Payable","liability"),("2110","GST Input Credit","asset"),("3000","Owner Equity","equity"),("4000","Jewellery Sales","income"),("4010","Making Charges Income","income"),("5000","Cost of Goods Sold","expense"),("6000","General Expenses","expense")]
 
 def init_db(password_hasher)->None:
     with connect() as conn:
-        conn.executescript(SCHEMA); _migrate_schema(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
+        conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Main Counter',1)",(branch_id,))
         for code,name,typ in DEFAULT_ACCOUNTS: conn.execute("INSERT OR IGNORE INTO accounts(code,name,account_type,active) VALUES(?,?,?,1)",(code,name,typ))
         for key,name in TALLY_DEFAULT_MAPPINGS.items(): conn.execute("INSERT OR IGNORE INTO tally_ledger_mappings(mapping_key,tally_ledger_name,updated_at) VALUES(?,?,?)",(key,name,now))
         defaults={"business_name":"My Jewellery Store","business_address":"","business_phone":"","business_gstin":"","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
         for k,v in defaults.items(): conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(k,v,now))
         if not conn.execute("SELECT id FROM users WHERE username='admin'").fetchone(): conn.execute("INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",("admin",password_hasher("Jewel@123"),"Administrator","admin",now,now))
         for seq in ("invoice","purchase","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))
+        from .integrity import assert_storage_integrity
+        assert_storage_integrity(conn)
 
 def next_sequence(conn,name,prefix="",width=6):
     conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(name,));conn.execute("UPDATE sequences SET value=value+1 WHERE name=?",(name,));value=conn.execute("SELECT value FROM sequences WHERE name=?",(name,)).fetchone()[0];return f"{prefix}{value:0{width}d}"
 
 def get_settings(conn): return {r["key"]:r["value"] for r in conn.execute("SELECT key,value FROM settings")}
 def set_setting(conn,key,value): conn.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(key,value,utcnow()))
-def audit(conn,user_id,action,entity,entity_id=None,details=None,client_ip=None): conn.execute("INSERT INTO audit_log(user_id,action,entity,entity_id,details_json,client_ip,created_at) VALUES(?,?,?,?,?,?,?)",(user_id,action,entity,None if entity_id is None else str(entity_id),None if details is None else json.dumps(details,ensure_ascii=False,default=str),client_ip,utcnow()))
+def audit(conn,user_id,action,entity,entity_id=None,details=None,client_ip=None):
+    from .audit_chain import GENESIS_HASH, compute_audit_hash
+    entity_id_s = None if entity_id is None else str(entity_id)
+    details_json = None if details is None else json.dumps(details,ensure_ascii=False,default=str,sort_keys=True,separators=(",", ":"))
+    created_at = utcnow()
+    row = conn.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+    prev_hash = (row[0] if row and row[0] else GENESIS_HASH)
+    entry_hash = compute_audit_hash(prev_hash,user_id,action,entity,entity_id_s,details_json,client_ip,created_at)
+    conn.execute(
+        "INSERT INTO audit_log(user_id,action,entity,entity_id,details_json,client_ip,created_at,prev_hash,entry_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+        (user_id,action,entity,entity_id_s,details_json,client_ip,created_at,prev_hash,entry_hash),
+    )
