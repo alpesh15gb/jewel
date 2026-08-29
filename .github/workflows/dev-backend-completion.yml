@@ -1,0 +1,36 @@
+name: Apply backend completion
+
+on:
+  push:
+    branches: [production-release]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production-release
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply and compile backend completion
+        shell: pwsh
+        run: |
+          python scripts/apply_backend_completion.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m compileall -q jewel_client jewel_server jewel_tally_bridge tests scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Commit generated backend source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jewel_server/returns.py jewel_server/services.py jewel_server/db.py jewel_server/main.py jewel_server/tally.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Complete credit note and net reporting backend"
+          git push origin HEAD:production-release
