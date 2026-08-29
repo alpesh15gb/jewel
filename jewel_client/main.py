@@ -10,10 +10,11 @@ from typing import Any
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
-from .api import Api, ApiError, discover_servers
+from .api import Api, ApiError, discover_servers, format_fingerprint, probe_server_fingerprint, secure_url
 from .config import load_config, save_config
 from .scale import read_scale
 from .ui_theme import PALETTE, apply_theme, card, divider, status_pill
+from .returns_page import ReturnsPage
 
 APP_TITLE = "JewelLAN Jewellery ERP"
 PRODUCTION_HARDENED_V1 = True
@@ -159,7 +160,7 @@ class LoginDialog(tk.Toplevel):
         right = ttk.Frame(shell, style="Surface.TFrame", padding=32); right.pack(side="left", fill="both", expand=True, padx=(22, 26), pady=28)
         ttk.Label(right, text="Welcome back", style="Section.TLabel", font=("Segoe UI Semibold", 19)).pack(anchor="w")
         ttk.Label(right, text="Sign in to this shop's private LAN.", style="SurfaceMuted.TLabel").pack(anchor="w", pady=(3, 20))
-        self.server = tk.StringVar(value=cfg.get("server_url") or "http://127.0.0.1:8765")
+        self.server = tk.StringVar(value=secure_url(cfg.get("server_url") or "https://127.0.0.1:8765")); self.discovered_fingerprint = ""
         self.username = tk.StringVar(value="admin"); self.password = tk.StringVar()
         frm = ttk.Frame(right, style="Surface.TFrame"); frm.pack(fill="x")
         for r, (label, var) in enumerate((("Server", self.server), ("Username", self.username), ("Password", self.password))):
@@ -173,17 +174,36 @@ class LoginDialog(tk.Toplevel):
         ttk.Label(right, textvariable=self.status, style="SurfaceMuted.TLabel", wraplength=390).pack(anchor="w", pady=(12, 12))
         ttk.Button(right, text="Sign in", style="Primary.TButton", command=self.login).pack(fill="x", ipady=3)
 
-    def discover(self):
-        self.status.set("Searching the private LAN…"); self.update_idletasks(); servers = discover_servers()
-        if servers:
-            self.server.set(servers[0]["url"]); self.status.set(f"Found {servers[0].get('name','JewelLAN')} at {servers[0]['url']}")
+    def _trust_live_server(self, url, advertised_fingerprint=""):
+        url=secure_url(url);live=probe_server_fingerprint(url);advertised="".join(ch for ch in str(advertised_fingerprint or "") if ch.isalnum()).upper()
+        if advertised and advertised!=live:
+            raise ApiError("LAN discovery fingerprint does not match the server TLS certificate. Do not sign in.")
+        saved_url=secure_url(self.cfg.get("server_url") or "");saved="".join(ch for ch in str(self.cfg.get("server_fingerprint") or "") if ch.isalnum()).upper()
+        if saved_url==url and saved:
+            if saved!=live:raise ApiError("The JewelLAN server certificate changed. Verify the server PC before trusting the new identity.")
         else:
-            self.status.set("No server was discovered. Enter its LAN address manually.")
+            pretty=format_fingerprint(live)
+            message=f"""Secure server found at:
+{url}
+
+SHA-256 certificate fingerprint:
+{pretty}
+
+Verify this fingerprint on the server PC with 'JewelServer.exe --show-fingerprint'. Trust this server?"""
+            ok=messagebox.askyesno("Trust JewelLAN server?",message,parent=self)
+            if not ok:raise ApiError("Server identity was not trusted")
+        self.api.trust_server(url,live);self.cfg["server_url"]=url;self.cfg["server_fingerprint"]=live;save_config(self.cfg);return live
+
+    def discover(self):
+        self.status.set("Searching the private LAN securely…"); self.update_idletasks(); servers = discover_servers()
+        if servers:
+            server=servers[0];self.server.set(server["url"]);self.discovered_fingerprint=server.get("fingerprint_sha256","");self.status.set(f"Found {server.get('name','JewelLAN')} over HTTPS. Identity verification is required before sign-in.")
+        else:
+            self.status.set("No secure server was discovered. Enter its LAN address manually; HTTPS identity will be verified before sign-in.")
 
     def login(self):
         try:
-            self.api.set_url(self.server.get().strip()); self.user = self.api.login(self.username.get().strip(), self.password.get())
-            self.cfg["server_url"] = self.api.base_url; save_config(self.cfg); self.destroy()
+            url=secure_url(self.server.get().strip());self._trust_live_server(url,self.discovered_fingerprint);self.user = self.api.login(self.username.get().strip(), self.password.get());self.destroy()
         except ApiError as e:
             messagebox.showerror("Login failed", str(e), parent=self)
 
@@ -226,6 +246,7 @@ class App(ttk.Frame):
         role = self.user.get("role", "cashier")
         pages = [("Overview", DashboardPage), ("Inventory", InventoryPage), ("Parties", PartiesPage)]
         if role in ("admin","manager","cashier"): pages.insert(1, ("Billing", POSPage))
+        if role in ("admin","manager"): pages.insert(2, ("Returns & Credit Notes", ReturnsPage))
         if role in ("admin","manager","inventory"): pages.append(("Purchases", PurchasesPage))
         if role in ("admin","manager","cashier"): pages.append(("Repairs & Orders", JobsPage))
         if role in ("admin","manager","inventory"): pages.append(("Stock Audit", StockAuditPage))
@@ -692,7 +713,7 @@ class AdminPage(Page):
 
 
 def main():
-    root=tk.Tk();root.withdraw();cfg=load_config();api=Api(cfg.get("server_url",""));login=LoginDialog(root,api,cfg);root.wait_window(login)
+    root=tk.Tk();root.withdraw();cfg=load_config();api=Api(cfg.get("server_url",""),cfg.get("server_fingerprint",""));login=LoginDialog(root,api,cfg);root.wait_window(login)
     if not login.user:return
     if login.user.get("must_change_password") and not force_initial_password_change(root,api,login.user):return
     root.deiconify();App(root,api,cfg,login.user);root.mainloop()

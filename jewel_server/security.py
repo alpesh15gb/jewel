@@ -186,6 +186,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "inventory.read",
         "inventory.write",
         "sales",
+        "returns",
         "contacts",
         "purchases",
         "repairs",

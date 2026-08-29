@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from .precision import money, money_paise, weight_mg
@@ -81,6 +82,12 @@ MIRROR_FIELDS: dict[str, tuple[str, tuple[tuple[str, str, int], ...]]] = {
         "'journal-line#' || id",
         (("debit", "debit_paise", 100), ("credit", "credit_paise", 100)),
     ),
+    "customers": ("code || ' ' || name", (("balance", "balance_paise", 100),)),
+    "suppliers": ("code || ' ' || name", (("balance", "balance_paise", 100),)),
+    "karigars": (
+        "code || ' ' || name",
+        (("cash_balance", "cash_balance_paise", 100), ("metal_balance_grams", "metal_balance_mg", 1000)),
+    ),
 }
 
 
@@ -116,11 +123,11 @@ def canonical_integrity(conn, max_errors: int = 100) -> dict[str, Any]:
 
 
 def paise_to_money(value: Any) -> float:
-    return money((int(value or 0)) / 100)
+    return money(Decimal(int(value or 0)) / Decimal(100))
 
 
 def mg_to_weight(value: Any) -> float:
-    return int(value or 0) / 1000.0
+    return float(Decimal(int(value or 0)) / Decimal(1000))
 
 
 def expected_exact_value(value: Any, scale: int) -> int:

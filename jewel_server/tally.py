@@ -411,6 +411,43 @@ def _load_payload(conn, row: dict[str, Any], settings: dict[str, str], mappings:
         )
         return xml, _required_static_ledgers(entries, set()), []
 
+    if typ in {"sale_return", "sale_return_cogs"}:
+        ret_row = conn.execute("SELECT * FROM sale_returns WHERE id=?", (entity_id,)).fetchone()
+        if not ret_row:
+            raise TallySyncError(f"Sales return {entity_id} no longer exists")
+        ret = dict(ret_row)
+        sale_row = conn.execute("SELECT * FROM sales WHERE id=?", (ret["sale_id"],)).fetchone()
+        sale = dict(sale_row) if sale_row else {}
+        customer_row = conn.execute("SELECT * FROM customers WHERE id=?", (ret["customer_id"],)).fetchone() if ret.get("customer_id") else None
+        customer = dict(customer_row) if customer_row else None
+        if typ == "sale_return":
+            entries: list[dict[str, Any]] = []
+            party_names: set[str] = set()
+            taxable=qmoney(Decimal(int(ret["taxable_paise"]))/100)
+            gst=qmoney(Decimal(int(ret["gst_paise"]))/100)
+            if taxable: entries.append({"ledger":_mapping(mappings,"sales"),"amount":taxable,"debit":True})
+            for key,mapkey in (("cgst_paise","cgst"),("sgst_paise","sgst"),("igst_paise","igst")):
+                value=qmoney(Decimal(int(ret[key] or 0))/100)
+                if value: entries.append({"ledger":_mapping(mappings,mapkey),"amount":value,"debit":True})
+            ro=qmoney(Decimal(int(ret["round_off_paise"] or 0))/100)
+            if ro: entries.append({"ledger":_mapping(mappings,"round_off"),"amount":abs(ro),"debit":ro>0})
+            cash=qmoney(Decimal(int(ret["refund_cash_paise"] or 0))/100)
+            bank=qmoney(Decimal(int(ret["refund_card_paise"] or 0)+int(ret["refund_upi_paise"] or 0))/100)
+            credit=qmoney(Decimal(int(ret["refund_credit_paise"] or 0))/100)
+            if cash: entries.append({"ledger":_mapping(mappings,"cash"),"amount":cash,"debit":False})
+            if bank: entries.append({"ledger":_mapping(mappings,"bank"),"amount":bank,"debit":False})
+            if credit:
+                if not customer: raise TallySyncError("Customer-account sales return has no customer")
+                party_name=str(customer["name"]);party_names.add(party_name);party_to_create.append((customer,"Sundry Debtors"))
+                entries.append({"ledger":party_name,"amount":credit,"debit":False,"party":True,"bill_ref":sale.get("invoice_no") or ret["return_no"],"bill_type":"Agst Ref"})
+            xml=build_voucher_xml(company=company,voucher_type="Credit Note",voucher_number=ret["return_no"],date=_voucher_date(ret["business_date"]),remote_id=row["remote_id"],entries=entries,narration=f"JewelLAN sales return {ret['return_no']} against {sale.get('invoice_no','')}",action="Cancel" if op=="cancel" else "Create")
+            return xml,_required_static_ledgers(entries,party_names),party_to_create
+        cost_paise=conn.execute("SELECT coalesce(sum(cost_amount_paise),0) v FROM sale_return_items WHERE return_id=?",(entity_id,)).fetchone()["v"]
+        cost=qmoney(Decimal(int(cost_paise or 0))/100)
+        entries=[{"ledger":_mapping(mappings,"inventory"),"amount":cost,"debit":True},{"ledger":_mapping(mappings,"cogs"),"amount":cost,"debit":False}]
+        xml=build_voucher_xml(company=company,voucher_type="Journal",voucher_number=f"{ret['return_no']}-COGS",date=_voucher_date(ret["business_date"]),remote_id=row["remote_id"],entries=entries,narration=f"Restore jewellery cost on {ret['return_no']}",action="Cancel" if op=="cancel" else "Create")
+        return xml,_required_static_ledgers(entries,set()),[]
+
     if typ == "purchase":
         pur_row = conn.execute("SELECT * FROM purchases WHERE id=?", (entity_id,)).fetchone()
         if not pur_row:
@@ -558,78 +595,50 @@ def validate_mappings(settings: dict[str, str], mappings: dict[str, str]) -> dic
 
 
 def backfill_queue() -> dict[str, int]:
-    counts = {"sales": 0, "sale_cogs": 0, "purchases": 0}
+    counts = {"sales": 0, "sale_cogs": 0, "returns": 0, "return_cogs": 0, "purchases": 0}
     with write_db() as conn:
         for s in conn.execute("SELECT id,status FROM sales ORDER BY id").fetchall():
-            op = "cancel" if s["status"] == "cancelled" else "create"
-            enqueue_tally(conn, "sale", s["id"], op)
-            counts["sales"] += 1
-            cost = qmoney(conn.execute("SELECT coalesce(sum(cost_amount),0) FROM sale_items WHERE sale_id=?", (s["id"],)).fetchone()[0])
-            if cost:
-                enqueue_tally(conn, "sale_cogs", s["id"], op)
-                counts["sale_cogs"] += 1
+            enqueue_tally(conn,"sale",s["id"],"create");counts["sales"]+=1
+            cost_paise=int(conn.execute("SELECT coalesce(sum(cost_amount_paise),0) FROM sale_items WHERE sale_id=?",(s["id"],)).fetchone()[0])
+            if cost_paise:enqueue_tally(conn,"sale_cogs",s["id"],"create");counts["sale_cogs"]+=1
+            if s["status"]=="cancelled":
+                enqueue_tally(conn,"sale",s["id"],"cancel")
+                if cost_paise:enqueue_tally(conn,"sale_cogs",s["id"],"cancel")
+        for r in conn.execute("SELECT id,status FROM sale_returns ORDER BY id").fetchall():
+            enqueue_tally(conn,"sale_return",r["id"],"create");counts["returns"]+=1
+            cost_paise=int(conn.execute("SELECT coalesce(sum(cost_amount_paise),0) FROM sale_return_items WHERE return_id=?",(r["id"],)).fetchone()[0])
+            if cost_paise:enqueue_tally(conn,"sale_return_cogs",r["id"],"create");counts["return_cogs"]+=1
+            if r["status"]=="cancelled":
+                enqueue_tally(conn,"sale_return",r["id"],"cancel")
+                if cost_paise:enqueue_tally(conn,"sale_return_cogs",r["id"],"cancel")
         for p in conn.execute("SELECT id FROM purchases ORDER BY id").fetchall():
-            enqueue_tally(conn, "purchase", p["id"], "create")
-            counts["purchases"] += 1
+            enqueue_tally(conn,"purchase",p["id"],"create");counts["purchases"]+=1
     return counts
 
 
 def reconcile(date_from: str, date_to: str) -> dict[str, Any]:
     with read_db() as conn:
-        settings = get_settings(conn)
-        sales = rowsdict(
-            conn.execute(
-                """SELECT s.id,s.invoice_no,s.total,s.status,s.created_at,
-                          coalesce(sum(si.cost_amount),0) cogs
-                   FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id
-                   WHERE substr(s.created_at,1,10) BETWEEN ? AND ?
-                   GROUP BY s.id ORDER BY s.id""",
-                (date_from, date_to),
-            ).fetchall()
-        )
-        purchases = rowsdict(
-            conn.execute(
-                "SELECT id,purchase_no,total,created_at FROM purchases WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id",
-                (date_from, date_to),
-            ).fetchall()
-        )
-    remote = _bridge_request(
-        settings,
-        "GET",
-        "/daybook",
-        params={"company": _setting(settings, "tally_company"), "date_from": date_from, "date_to": date_to},
-        timeout=45,
-    )
-    vouchers = remote.get("vouchers", [])
-    by_key = {(str(v.get("type") or "").lower(), str(v.get("number") or "")): v for v in vouchers}
-    expected: list[dict[str, Any]] = []
+        settings=get_settings(conn)
+        sales=rowsdict(conn.execute("""SELECT s.id,s.invoice_no,s.total,s.status,s.business_date,coalesce(sum(si.cost_amount_paise),0)/100.0 cogs FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id WHERE s.business_date BETWEEN ? AND ? GROUP BY s.id ORDER BY s.id""",(date_from,date_to)).fetchall())
+        returns=rowsdict(conn.execute("""SELECT r.id,r.return_no,r.total_paise/100.0 total,r.status,r.business_date,coalesce(sum(ri.cost_amount_paise),0)/100.0 cogs FROM sale_returns r LEFT JOIN sale_return_items ri ON ri.return_id=r.id WHERE r.business_date BETWEEN ? AND ? GROUP BY r.id ORDER BY r.id""",(date_from,date_to)).fetchall())
+        purchases=rowsdict(conn.execute("SELECT id,purchase_no,total,business_date FROM purchases WHERE business_date BETWEEN ? AND ? ORDER BY id",(date_from,date_to)).fetchall())
+    remote=_bridge_request(settings,"GET","/daybook",params={"company":_setting(settings,"tally_company"),"date_from":date_from,"date_to":date_to},timeout=45)
+    vouchers=remote.get("vouchers",[]);by_key={(str(v.get("type") or "").lower(),str(v.get("number") or "")):v for v in vouchers};expected=[]
     for s in sales:
-        if s["status"] != "posted":
-            continue
-        expected.append({"type": "Sales", "number": s["invoice_no"], "amount": float(qmoney(s["total"]))})
-        if qmoney(s["cogs"]):
-            expected.append({"type": "Journal", "number": f"{s['invoice_no']}-COGS", "amount": float(qmoney(s["cogs"]))})
-    for p in purchases:
-        expected.append({"type": "Purchase", "number": p["purchase_no"], "amount": float(qmoney(p["total"]))})
-    missing = []
-    amount_mismatches = []
+        if s["status"]!="posted":continue
+        expected.append({"type":"Sales","number":s["invoice_no"],"amount":float(qmoney(s["total"]))})
+        if qmoney(s["cogs"]):expected.append({"type":"Journal","number":f"{s['invoice_no']}-COGS","amount":float(qmoney(s["cogs"]))})
+    for r in returns:
+        if r["status"]!="posted":continue
+        expected.append({"type":"Credit Note","number":r["return_no"],"amount":float(qmoney(r["total"]))})
+        if qmoney(r["cogs"]):expected.append({"type":"Journal","number":f"{r['return_no']}-COGS","amount":float(qmoney(r["cogs"]))})
+    for p in purchases:expected.append({"type":"Purchase","number":p["purchase_no"],"amount":float(qmoney(p["total"]))})
+    missing=[];amount_mismatches=[]
     for e in expected:
-        r = by_key.get((e["type"].lower(), e["number"]))
-        if not r:
-            missing.append(e)
-            continue
-        if r.get("amount") is not None and abs(float(r["amount"]) - e["amount"]) > 0.05:
-            amount_mismatches.append({"expected": e, "tally": r})
-    return {
-        "date_from": date_from,
-        "date_to": date_to,
-        "expected_count": len(expected),
-        "found_count": len(expected) - len(missing),
-        "missing": missing,
-        "amount_mismatches": amount_mismatches,
-        "tally_voucher_count": len(vouchers),
-        "ok": not missing and not amount_mismatches,
-    }
+        r=by_key.get((e["type"].lower(),e["number"]))
+        if not r:missing.append(e);continue
+        if r.get("amount") is not None and abs(abs(float(r["amount"]))-abs(e["amount"]))>0.05:amount_mismatches.append({"expected":e,"tally":r})
+    return {"date_from":date_from,"date_to":date_to,"expected_count":len(expected),"found_count":len(expected)-len(missing),"missing":missing,"amount_mismatches":amount_mismatches,"tally_voucher_count":len(vouchers),"ok":not missing and not amount_mismatches}
 
 
 class TallySyncWorker(threading.Thread):
