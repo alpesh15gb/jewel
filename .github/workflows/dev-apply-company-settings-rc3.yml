@@ -1,0 +1,41 @@
+name: Apply company settings RC3
+
+on:
+  push:
+    branches: [company-settings-rc3]
+    paths:
+      - scripts/apply_company_settings_rc3.py
+      - .github/workflows/dev-apply-company-settings-rc3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: company-settings-rc3
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply company settings patch
+        run: python scripts/apply_company_settings_rc3.py
+      - name: Compile changed Python source
+        run: python -m compileall -q jewel_server jewel_client tests
+      - name: Check diff
+        run: git diff --check
+      - name: Commit generated source
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No source changes required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jewel_server jewel_client tests installer docs
+          git commit -m "Replace hardcoded shop defaults with company settings"
+          git push origin HEAD:company-settings-rc3
