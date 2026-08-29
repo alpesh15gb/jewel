@@ -1,3 +1,4 @@
+import datetime as dt
 import os
 import shutil
 import sqlite3
@@ -20,19 +21,42 @@ from fastapi.testclient import TestClient
 
 from jewel_server.audit_chain import verify_audit_chain
 from jewel_server.backup import create_backup, verify_backup
-from jewel_server.db import read_db, write_db
+from jewel_server.canonical import canonical_integrity
+from jewel_server.db import business_date, read_db, set_setting, write_db
 from jewel_server.main import app
-from jewel_server.precision import money, weight
-from jewel_server.services import create_item, post_sale
+from jewel_server.precision import money, money_paise, weight, weight_mg
+from jewel_server.services import post_sale
+
+TEST_ADMIN_PASSWORD = "JewelTest#1234"
 
 
 def login(client, username="admin", password="Jewel@123"):
-    r = client.post(
-        "/api/auth/login",
-        json={"username": username, "password": password, "client_name": "hardening-pytest"},
-    )
-    assert r.status_code == 200, r.text
-    return {"Authorization": f"Bearer {r.json()['token']}"}, r.json()["user"]
+    candidates = [password]
+    if username == "admin" and TEST_ADMIN_PASSWORD not in candidates:
+        candidates.insert(0, TEST_ADMIN_PASSWORD)
+    last = None
+    for candidate in candidates:
+        r = client.post(
+            "/api/auth/login",
+            json={"username": username, "password": candidate, "client_name": "hardening-pytest"},
+        )
+        last = r
+        if r.status_code != 200:
+            continue
+        payload = r.json()
+        headers = {"Authorization": f"Bearer {payload['token']}"}
+        user = payload["user"]
+        if user.get("must_change_password"):
+            new_password = TEST_ADMIN_PASSWORD if username == "admin" else candidate + "!Changed"
+            changed = client.post(
+                "/api/auth/change-password",
+                headers=headers,
+                json={"old_password": candidate, "new_password": new_password},
+            )
+            assert changed.status_code == 200, changed.text
+            user["must_change_password"] = 0
+        return headers, user
+    assert last is not None and last.status_code == 200, last.text if last is not None else "login failed"
 
 
 def add_rate(client, headers, metal="Gold", purity="916", rate=6000):
@@ -76,6 +100,36 @@ def test_decimal_rounding_is_half_up_and_deterministic():
     assert weight("0.0005") == 0.001
 
 
+def test_password_change_is_enforced_server_side_before_operational_access():
+    with TestClient(app) as client:
+        admin_headers, _ = login(client)
+        suffix = uuid.uuid4().hex[:6]
+        username = f"cash{suffix}"
+        temporary = "Cashier#1234"
+        made = client.post(
+            "/api/users",
+            headers=admin_headers,
+            json={"username": username, "full_name": "Password Gate Cashier", "role": "cashier", "password": temporary},
+        )
+        assert made.status_code == 200, made.text
+
+        raw = client.post("/api/auth/login", json={"username": username, "password": temporary, "client_name": "gate-test"})
+        assert raw.status_code == 200, raw.text
+        token_headers = {"Authorization": f"Bearer {raw.json()['token']}"}
+        assert raw.json()["user"]["must_change_password"] == 1
+        blocked = client.get("/api/dashboard", headers=token_headers)
+        assert blocked.status_code == 428, blocked.text
+
+        changed = client.post(
+            "/api/auth/change-password",
+            headers=token_headers,
+            json={"old_password": temporary, "new_password": "Cashier#12345New"},
+        )
+        assert changed.status_code == 200, changed.text
+        allowed = client.get("/api/dashboard", headers=token_headers)
+        assert allowed.status_code == 200, allowed.text
+
+
 def test_weight_auto_calculation_huid_format_and_duplicate_protection():
     with TestClient(app) as client:
         headers, _ = login(client)
@@ -106,6 +160,75 @@ def test_weight_auto_calculation_huid_format_and_duplicate_protection():
 
         duplicate = client.post("/api/items", headers=headers, json=make_item_payload(huid=huid.upper()))
         assert duplicate.status_code == 409
+
+
+def test_canonical_paise_and_milligram_storage_is_populated_and_guarded():
+    with TestClient(app) as client:
+        headers, _ = login(client)
+        add_rate(client, headers, rate="6000.005")
+        made = client.post(
+            "/api/items",
+            headers=headers,
+            json=make_item_payload(gross_weight="5.125", stone_weight="0.125", stone_value="250.005", cost_amount="20000.005"),
+        )
+        assert made.status_code == 200, made.text
+        item = made.json()
+
+        with read_db() as conn:
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item["id"],)).fetchone()
+            assert row["gross_mg"] == weight_mg(row["gross_weight"]) == 5125
+            assert row["stone_mg"] == 125
+            assert row["net_mg"] == 5000
+            assert row["stone_value_paise"] == money_paise(row["stone_value"])
+            assert row["cost_amount_paise"] == money_paise(row["cost_amount"])
+            assert canonical_integrity(conn)["ok"] is True
+
+        with pytest.raises(sqlite3.DatabaseError):
+            with write_db() as conn:
+                # Direct legacy-value mutation without its canonical mirror must be rejected.
+                conn.execute("UPDATE items SET cost_amount=cost_amount+1 WHERE id=?", (item["id"],))
+
+        quote = client.post(
+            "/api/sales/quote", headers=headers, json={"lines": [{"item_id": item["id"]}], "old_gold": []}
+        )
+        assert quote.status_code == 200, quote.text
+        sale = client.post(
+            "/api/sales",
+            headers=headers,
+            json={
+                "client_request_id": str(uuid.uuid4()),
+                "branch_id": 1,
+                "counter_id": 1,
+                "lines": [{"item_id": item["id"]}],
+                "old_gold": [],
+                "payment_cash": quote.json()["total"],
+                "payment_card": 0,
+                "payment_upi": 0,
+                "payment_credit": 0,
+            },
+        )
+        assert sale.status_code == 200, sale.text
+        with read_db() as conn:
+            s = conn.execute("SELECT * FROM sales WHERE id=?", (sale.json()["id"],)).fetchone()
+            assert s["total_paise"] == money_paise(s["total"])
+            assert s["payment_cash_paise"] == s["total_paise"]
+            line = conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (s["id"],)).fetchone()
+            assert line["line_total_paise"] == money_paise(line["line_total"])
+            assert line["gross_mg"] == weight_mg(line["gross_weight"])
+            assert canonical_integrity(conn)["ok"] is True
+
+
+def test_business_timezone_drives_business_date():
+    with write_db() as conn:
+        set_setting(conn, "business_timezone_offset_minutes", "840")
+    try:
+        with read_db() as conn:
+            got = business_date(conn)
+        expected = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=840)).date().isoformat()
+        assert got == expected
+    finally:
+        with write_db() as conn:
+            set_setting(conn, "business_timezone_offset_minutes", "330")
 
 
 def test_manager_net_weight_override_requires_reason_and_is_audited():
@@ -318,6 +441,8 @@ def test_integrity_report_and_day_close_are_clean_after_valid_transactions():
         assert body["foreign_key_violations"] == 0
         assert body["unbalanced_journals"] == 0
         assert body["audit_chain"]["ok"] is True
+        assert body["canonical"]["ok"] is True
+        assert body["canonical"]["mismatches"] == 0
 
         close = client.get("/api/reports/day-close", headers=headers)
         assert close.status_code == 200, close.text
