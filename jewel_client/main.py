@@ -136,7 +136,7 @@ class App(ttk.Frame):
         if role in ("admin","manager","accounts"): pages.append(("Reports", ReportsPage))
         if role in ("admin","manager"): pages.append(("Administration", AdminPage))
         for name, cls in pages: ttk.Button(nav, text=name, style="Nav.TButton", command=lambda c=cls: self.show(c)).pack(fill="x", pady=2)
-        ttk.Separator(nav).pack(fill="x", pady=10); ttk.Button(nav, text="Change Password", style="Nav.TButton", command=self.change_password).pack(fill="x"); ttk.Button(nav, text="Exit", style="Nav.TButton", command=root.destroy).pack(fill="x", pady=2)
+        ttk.Separator(nav).pack(fill="x", pady=10); ttk.Button(nav, text="Change Password", style="Nav.TButton", command=self.change_password).pack(fill="x"); ttk.Button(nav, text="Exit", style="Nav.TButton", command=self.root.destroy).pack(fill="x", pady=2)
         self.show(DashboardPage)
 
     def show(self, cls):
