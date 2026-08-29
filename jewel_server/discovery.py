@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
+
+from .tls import tls_identity
 
 DISCOVERY_PORT = 8766
 MAGIC = b"JEWELLAN_DISCOVER_V1"
@@ -17,6 +20,9 @@ class DiscoveryResponder(threading.Thread):
         self.sock: socket.socket | None = None
 
     def run(self) -> None:
+        insecure = os.environ.get("JEWELLAN_INSECURE_HTTP") == "1"
+        identity = {} if insecure else tls_identity()
+        scheme = "http" if insecure else "https"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -32,8 +38,16 @@ class DiscoveryResponder(threading.Thread):
                     ip = socket.gethostbyname(socket.gethostname())
                 finally:
                     probe.close()
-                payload = json.dumps({"name":"JewelLAN Server","url":f"http://{ip}:{self.http_port}","version":1}).encode()
-                sock.sendto(payload, addr)
+                payload = {
+                    "name":"JewelLAN Server",
+                    "url":f"{scheme}://{ip}:{self.http_port}",
+                    "version":3,
+                    "transport":scheme,
+                }
+                if identity:
+                    payload["fingerprint_sha256"] = identity["fingerprint_sha256"]
+                    payload["fingerprint"] = identity["fingerprint"]
+                sock.sendto(json.dumps(payload).encode(), addr)
             except socket.timeout:
                 pass
             except OSError:
