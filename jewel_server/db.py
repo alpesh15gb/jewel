@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
 PRODUCTION_HARDENED_V1 = True
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 def app_data_dir() -> Path:
@@ -484,15 +484,58 @@ def _migration_5(conn) -> None:
         if conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Main Counter'",(bid,)).fetchone() and not conn.execute("SELECT 1 FROM counters WHERE branch_id=? AND name='Counter 1'",(bid,)).fetchone():
             conn.execute("UPDATE counters SET name='Counter 1' WHERE branch_id=? AND name='Main Counter'",(bid,))
         conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(bid,))
-        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 2',1)",(bid,))
-        conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 3',1)",(bid,))
-        conn.execute("UPDATE branches SET name='Bijoria Main Showroom' WHERE id=? AND name='Main Showroom'",(bid,))
-    conn.execute("UPDATE settings SET value='Bijoria',updated_at=? WHERE key='business_name' AND value='My Jewellery Store'",(utcnow(),))
-    conn.execute("UPDATE settings SET value='36',updated_at=? WHERE key='business_state_code' AND trim(value)=''",(utcnow(),))
     conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES('return',0)")
 
 
-MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5))
+
+def _migration_6(conn) -> None:
+    """Remove the RC1/RC2 demo-shop seed and introduce generic company setup state.
+
+    Existing real stores are never renamed.  The old deployment-specific values are
+    cleared only when the database has no business data and still exactly matches the
+    obsolete seed shipped in the release candidates.
+    """
+    counts = 0
+    for table in ("items", "sales", "sale_returns", "purchases", "customers", "suppliers", "karigars", "repairs", "orders", "approvals", "stock_audits"):
+        counts += int(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+    business = conn.execute("SELECT value FROM settings WHERE key='business_name'").fetchone()
+    branch = conn.execute("SELECT id,name FROM branches WHERE code='MAIN'").fetchone()
+    old_seed = bool(
+        counts == 0
+        and business
+        and business[0] == "Bijoria"
+        and branch
+        and branch["name"] == "Bijoria Main Showroom"
+    )
+    if old_seed:
+        now = utcnow()
+        conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_name'", (now,))
+        conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_state_code'", (now,))
+        conn.execute("UPDATE branches SET name='Main Showroom',gstin='',address='',phone='' WHERE id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
+
+    now = utcnow()
+    defaults = {
+        "company_setup_complete": "0",
+        "business_email": "",
+        "business_state_name": "",
+        "business_pincode": "",
+    }
+    for key, value in defaults.items():
+        conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)", (key, value, now))
+
+    if not old_seed:
+        configured = conn.execute("SELECT value FROM settings WHERE key='business_name'").fetchone()
+        current = str(configured[0] if configured else '').strip()
+        if current and current not in ("My Jewellery Store", "Bijoria"):
+            conn.execute("UPDATE settings SET value='1',updated_at=? WHERE key='company_setup_complete'", (now,))
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5), (6, _migration_6))
 
 def _migrate_schema(conn) -> None:
     applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
@@ -525,10 +568,10 @@ DEFAULT_ACCOUNTS=[("1000","Cash","asset"),("1010","Bank / Card / UPI","asset"),(
 
 def init_db(password_hasher)->None:
     with connect() as conn:
-        conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Bijoria Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(branch_id,)); conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 2',1)",(branch_id,)); conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 3',1)",(branch_id,))
+        conn.executescript(SCHEMA); _migrate_schema(conn); _ensure_optional_indexes(conn); now=utcnow(); conn.execute("INSERT OR IGNORE INTO branches(code,name,gstin,address,phone,active) VALUES('MAIN','Main Showroom','','','',1)"); branch_id=conn.execute("SELECT id FROM branches WHERE code='MAIN'").fetchone()[0]; conn.execute("INSERT OR IGNORE INTO counters(branch_id,name,active) VALUES(?,'Counter 1',1)",(branch_id,))
         for code,name,typ in DEFAULT_ACCOUNTS: conn.execute("INSERT OR IGNORE INTO accounts(code,name,account_type,active) VALUES(?,?,?,1)",(code,name,typ))
         for key,name in TALLY_DEFAULT_MAPPINGS.items(): conn.execute("INSERT OR IGNORE INTO tally_ledger_mappings(mapping_key,tally_ledger_name,updated_at) VALUES(?,?,?)",(key,name,now))
-        defaults={"business_name":"Bijoria","business_address":"","business_phone":"","business_gstin":"","business_timezone_offset_minutes":"330","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","business_state_code":"36","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
+        defaults={"business_name":"","business_address":"","business_phone":"","business_email":"","business_gstin":"","business_state_code":"","business_state_name":"","business_pincode":"","company_setup_complete":"0","business_timezone_offset_minutes":"330","currency":"INR","invoice_prefix":"INV","tag_prefix":"TAG","gst_default":"3","label_width_mm":"60","label_height_mm":"25","backup_interval_hours":"6","backup_retention_days":"30","tally_enabled":"0","tally_bridge_url":"http://127.0.0.1:8767","tally_bridge_token":"","tally_company":"","tally_auto_create_parties":"1"}
         for k,v in defaults.items(): conn.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(k,v,now))
         if not conn.execute("SELECT id FROM users WHERE username='admin'").fetchone(): conn.execute("INSERT INTO users(username,password_hash,full_name,role,active,must_change_password,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",("admin",password_hasher("Jewel@123"),"Administrator","admin",now,now))
         for seq in ("invoice","purchase","return","customer","supplier","karigar","repair","order","approval","audit","journal","tag"): conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(seq,))

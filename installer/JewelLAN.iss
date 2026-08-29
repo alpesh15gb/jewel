@@ -1,6 +1,6 @@
 #define MyAppName "JewelLAN"
-#define MyAppVersion "1.2.0-rc2"
-#define MyFileVersion "1.2.0.1"
+#define MyAppVersion "1.2.0-rc3"
+#define MyFileVersion "1.2.0.2"
 #define MyPublisher "JewelLAN"
 #define MyClientExe "JewelPOS.exe"
 #define MyServerExe "JewelServer.exe"

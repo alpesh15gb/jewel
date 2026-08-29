@@ -63,3 +63,38 @@ def test_purchase_creates_tag_and_backup():
         p = c.post("/api/purchases", headers=h, json={"client_request_id": str(uuid.uuid4()), "supplier_id": s.json()["id"], "branch_id": 1, "paid": 1000, "items": [{"name": "Silver Chain", "category": "Chain", "metal": "Silver", "purity": "925", "gross_weight": 20, "stone_weight": 0, "net_weight": 20, "cost_amount": 1000}]}); assert p.status_code == 200, p.text
         rows = c.get("/api/items", headers=h, params={"q": "Silver Chain"}).json(); assert rows and rows[0]["status"] == "in_stock"
         b = c.post("/api/backups", headers=h, json={"label": "pytest"}); assert b.status_code == 200, b.text
+
+
+
+def test_company_settings_are_generic_and_configurable():
+    with TestClient(app) as c:
+        h = auth_headers(c)
+        before = c.get("/api/company", headers=h)
+        assert before.status_code == 200, before.text
+        company = before.json()
+        assert company["settings"].get("business_name", "") != "Bijoria"
+        assert (company.get("branch") or {}).get("name", "") != "Bijoria Main Showroom"
+
+        saved = c.put("/api/company", headers=h, json={
+            "business_name": "Test Jewellers",
+            "branch_name": "Main Showroom",
+            "business_state_code": "36",
+            "business_state_name": "Telangana",
+            "business_gstin": "",
+            "business_address": "Test Address",
+            "business_pincode": "500001",
+            "business_phone": "0400000000",
+            "business_email": "accounts@example.test",
+            "counter_count": 3,
+            "invoice_prefix": "INV",
+            "tag_prefix": "TAG",
+            "gst_default": "3",
+            "business_timezone_offset_minutes": "330",
+        })
+        assert saved.status_code == 200, saved.text
+        result = saved.json()
+        assert result["configured"] is True
+        assert result["settings"]["business_name"] == "Test Jewellers"
+        assert result["settings"]["business_state_code"] == "36"
+        assert result["branch"]["name"] == "Main Showroom"
+        assert len(result["counters"]) == 3
