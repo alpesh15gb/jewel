@@ -19,35 +19,20 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Repair known client defects
+      - name: Repair known client runtime defect
         shell: pwsh
         run: |
           @'
           from pathlib import Path
           p = Path('jewel_client/main.py')
           text = p.read_text(encoding='utf-8')
-          repairs = [
-              (
-                  'for k,v in self.totals.items():v.set(money(self.quote.get(k,0))',
-                  'for k,v in self.totals.items():v.set(money(self.quote.get(k,0)))',
-                  'missing POS totals parenthesis',
-              ),
-              (
-                  'command=root.destroy).pack(fill="x", pady=2)',
-                  'command=self.root.destroy).pack(fill="x", pady=2)',
-                  'undefined root reference in App.build',
-              ),
-          ]
-          changed = False
-          for bad, good, label in repairs:
-              if bad in text:
-                  text = text.replace(bad, good, 1)
-                  changed = True
-                  print(f'Repaired {label}')
-          if changed:
-              p.write_text(text, encoding='utf-8')
+          bad = 'command=root.destroy).pack(fill="x", pady=2)'
+          good = 'command=self.root.destroy).pack(fill="x", pady=2)'
+          if bad in text:
+              p.write_text(text.replace(bad, good, 1), encoding='utf-8')
+              print('Repaired undefined root reference in App.build')
           else:
-              print('Known client defects are already repaired.')
+              print('Known client runtime defect is already repaired.')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -65,7 +50,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add jewel_client/main.py
-            git commit -m "Fix JewelPOS client runtime defects"
+            git commit -m "Fix JewelPOS post-login root reference"
             git push origin HEAD:main
           }
 
