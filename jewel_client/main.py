@@ -236,7 +236,7 @@ class POSPage(Page):
             if self.lines:self.app.error(e)
     def render(self):
         self.t.delete(*self.t.get_children());[self.t.insert("","end",iid=str(r["item_id"]),values=tuple(r.get(c,"") for c in self.COLS)) for r in self.quote.get("lines",[])]
-        for k,v in self.totals.items():v.set(money(self.quote.get(k,0))
+        for k,v in self.totals.items():v.set(money(self.quote.get(k,0)))
         self.old_label.set("Old gold: "+money(sum(float(x.get("value",0)) for x in self.old)))
     def remove(self):
         if self.t.selection():self.lines=[x for x in self.lines if x["item_id"]!=int(self.t.selection()[0])];self.requote()
