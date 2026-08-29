@@ -70,6 +70,8 @@ def post_sale(conn,payload,user,client_ip=None):
     s=get_settings(conn);inv=next_sequence(conn,'invoice',s.get('invoice_prefix','INV')+'-'+dt.datetime.now().strftime('%y%m')+'-',6);now=utcnow();cid=payload.get('customer_id') or None;bid=int(payload.get('branch_id') or 1);counter=payload.get('counter_id') or None
     if credit and not cid:raise HTTPException(400,'Credit payment requires a customer')
     place,cgst,sgst,igst=gst_components(conn,cid,q['gst'],payload)
+    if credit and not cid:raise HTTPException(400,'Credit payment requires a customer')
+    place,cgst,sgst,igst=gst_components(conn,cid,q['gst'],payload)
     cur=conn.execute("INSERT INTO sales(invoice_no,client_request_id,branch_id,counter_id,customer_id,subtotal,discount,taxable,gst,place_of_supply_code,cgst,sgst,igst,round_off,total,payment_cash,payment_card,payment_upi,payment_credit,old_gold_value,notes,status,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posted',?,?)",(inv,req,bid,counter,cid,q['subtotal'],q['discount'],q['taxable'],q['gst'],place,cgst,sgst,igst,q['round_off'],q['total'],cash,card,upi,credit,old_value,payload.get('notes'),user['id'],now));sid=cur.lastrowid;cost=0
     for l in q['lines']:
         u=conn.execute("UPDATE items SET status='sold',version=version+1,updated_at=? WHERE id=? AND status='in_stock'",(now,l['item_id']))
