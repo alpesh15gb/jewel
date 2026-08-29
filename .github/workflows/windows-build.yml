@@ -19,41 +19,45 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Verify source imports
+        shell: pwsh
+        run: |
+          python -c "import jewel_client.main, jewel_client.api, jewel_client.config, jewel_client.scale; print(jewel_client.main.__file__)"
+          python -c "import jewel_server.main, jewel_server.db, jewel_server.services; print(jewel_server.main.__file__)"
+
       - name: Tests
         run: pytest -q
 
       - name: Build server EXE
         run: >-
           pyinstaller --noconfirm --clean --onefile --name JewelServer
-          --paths . --collect-submodules jewel_server
+          --paths .
+          --hidden-import jewel_server --hidden-import jewel_server.main
+          --hidden-import jewel_server.db --hidden-import jewel_server.services
+          --hidden-import jewel_server.security --hidden-import jewel_server.pdfs
+          --hidden-import jewel_server.backup --hidden-import jewel_server.discovery
           --collect-all fastapi --collect-all pydantic --collect-all uvicorn --collect-all reportlab
           run_server.py
 
       - name: Build Windows client EXE
         run: >-
           pyinstaller --noconfirm --clean --onefile --windowed --name JewelPOS
-          --paths . --collect-submodules jewel_client
+          --paths .
+          --hidden-import jewel_client --hidden-import jewel_client.main
+          --hidden-import jewel_client.api --hidden-import jewel_client.config
+          --hidden-import jewel_client.scale
           --collect-all requests --collect-all reportlab --hidden-import serial
           run_client.py
 
-      - name: Verify PyInstaller analysis includes local packages
+      - name: Self-test packaged JewelPOS executable
         shell: pwsh
         run: |
-          $client = Get-Content build\JewelPOS\Analysis-00.toc -Raw
-          if ($client -notmatch 'jewel_client\.main') { throw 'PyInstaller analysis is missing jewel_client.main' }
-          if ($client -notmatch 'jewel_client\.api') { throw 'PyInstaller analysis is missing jewel_client.api' }
-          if ($client -notmatch 'jewel_client\.config') { throw 'PyInstaller analysis is missing jewel_client.config' }
-          if ($client -notmatch 'jewel_client\.scale') { throw 'PyInstaller analysis is missing jewel_client.scale' }
-          $server = Get-Content build\JewelServer\Analysis-00.toc -Raw
-          if ($server -notmatch 'jewel_server\.main') { throw 'PyInstaller analysis is missing jewel_server.main' }
-
-      - name: Smoke test JewelPOS launch
-        shell: pwsh
-        run: |
-          $p = Start-Process -FilePath .\dist\JewelPOS.exe -PassThru
-          Start-Sleep -Seconds 7
-          if ($p.HasExited) { throw "JewelPOS.exe exited during launch smoke test with code $($p.ExitCode)" }
-          Stop-Process -Id $p.Id -Force
+          $p = Start-Process -FilePath .\dist\JewelPOS.exe -ArgumentList '--self-test' -PassThru
+          if (-not $p.WaitForExit(15000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'JewelPOS.exe self-test did not exit; a packaging error dialog may be blocking startup.'
+          }
+          if ($p.ExitCode -ne 0) { throw "JewelPOS.exe self-test failed with exit code $($p.ExitCode)" }
 
       - name: Install Inno Setup compiler
         shell: pwsh
