@@ -1,0 +1,39 @@
+name: Apply production hardening v2
+
+on:
+  push:
+    branches: [production-hardening-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: production-hardening-v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply production hardening v2
+        shell: pwsh
+        run: |
+          python scripts/apply_production_hardening_v2.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile patched source
+        shell: pwsh
+        run: |
+          python -m compileall -q jewel_client jewel_server jewel_tally_bridge run_client.py run_server.py run_tally_bridge.py tests scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Commit generated source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add jewel_server/db.py jewel_server/services.py jewel_server/security.py jewel_server/integrity.py jewel_server/main.py jewel_client/main.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Apply production hardening v2 exact storage and day-close"
+          git push origin HEAD:production-hardening-v2
