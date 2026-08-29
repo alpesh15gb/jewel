@@ -24,6 +24,8 @@ jobs:
         run: |
           python scripts/apply_tally_upgrade.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/apply_ui_redesign.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile every Python source file
         shell: pwsh
@@ -31,7 +33,7 @@ jobs:
           python -m compileall -q jewel_client jewel_server jewel_tally_bridge run_client.py run_server.py run_tally_bridge.py tests scripts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Persist generated source upgrade to main
+      - name: Persist generated source upgrades to main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
@@ -39,7 +41,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add jewel_client jewel_server installer README.md
-            git commit -m "Apply JewelLAN TallyPrime integration upgrade"
+            git commit -m "Apply JewelLAN generated source upgrades"
             git push origin HEAD:main
           }
 
@@ -49,15 +51,15 @@ jobs:
       - name: Verify source imports
         shell: pwsh
         run: |
-          python -c "import jewel_client.main, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main; print('imports ok')"
+          python -c "import jewel_client.main, jewel_client.ui_theme, jewel_server.main, jewel_server.tally, jewel_tally_bridge.main; print('imports ok')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Smoke test post-login GUI construction
+      - name: Smoke test redesigned desktop UI
         shell: pwsh
         run: |
           @'
           import tkinter as tk
-          from jewel_client.main import App
+          from jewel_client.main import App, POSPage, TallyPage
 
           class DummyApi:
               base_url = 'http://127.0.0.1:8765'
@@ -65,7 +67,7 @@ jobs:
                   if path == '/api/settings':
                       return {'settings': {'business_name': 'JewelLAN CI'}, 'branches': [], 'counters': []}
                   if path == '/api/dashboard':
-                      return {'stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
+                      return {'stock': {'c': 0, 'nw': 0.0}, 'today_sales': {'c': 0, 'total': 0.0}, 'pending_repairs': 0, 'pending_orders': 0, 'rates': [], 'categories': []}
                   if path == '/api/tally/status':
                       return {'enabled':'0','bridge_url':'http://127.0.0.1:8767','company':'','business_state_code':'','auto_create_parties':'1','mappings':{},'queue':{},'bridge':None}
                   if path == '/api/customers': return []
@@ -77,11 +79,18 @@ jobs:
                   if path == '/api/rates': return []
                   if path == '/api/users': return []
                   raise RuntimeError(f'Unexpected GUI smoke-test GET: {path}')
+              def post(self, path, data):
+                  if path == '/api/sales/quote':
+                      return {'lines': [], 'subtotal': 0, 'gst': 0, 'total': 0, 'payable': 0}
+                  raise RuntimeError(f'Unexpected GUI smoke-test POST: {path}')
 
           root = tk.Tk(); root.withdraw()
           app = App(root, DummyApi(), {'branch_id': 1, 'counter_id': 1}, {'full_name': 'CI Administrator', 'role': 'admin', 'must_change_password': 0})
-          root.update_idletasks(); assert app.winfo_exists(); root.destroy()
-          print('Post-login GUI constructed successfully.')
+          root.update_idletasks(); assert app.winfo_exists()
+          app.show(POSPage, 'Billing'); root.update_idletasks(); assert app.current_page.scan_entry.winfo_exists()
+          app.show(TallyPage, 'TallyPrime'); root.update_idletasks(); assert app.current_page.winfo_exists()
+          root.destroy()
+          print('Redesigned Dashboard, Billing and Tally screens constructed successfully.')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -106,7 +115,7 @@ jobs:
           --paths .
           --hidden-import jewel_client --hidden-import jewel_client.main
           --hidden-import jewel_client.api --hidden-import jewel_client.config
-          --hidden-import jewel_client.scale
+          --hidden-import jewel_client.scale --hidden-import jewel_client.ui_theme
           --collect-all requests --collect-all reportlab --hidden-import serial
           run_client.py
 
