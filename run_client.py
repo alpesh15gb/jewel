@@ -68,6 +68,11 @@ def _install_client_enhancements():
     return main_module
 
 
+def _install_enhanced_billing_page():
+    """Backward-compatible RC5 hook retained for billing regression tests/tools."""
+    return _install_client_enhancements()
+
+
 def launch() -> None:
     import tkinter as tk
     from tkinter import messagebox
