@@ -4,17 +4,17 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .main import form_dialog, money
-from .ui_theme import card, divider, status_pill
+from .ui_theme import card, status_pill
 
 
 RATE_FIELDS = (
-    ("gold_999", "Gold 999 (₹ / 10 g)", "Gold", "999", 10.0),
-    ("gold_995", "Gold 995 (₹ / 10 g)", "Gold", "995", 10.0),
-    ("gold_916", "Gold 916 / 22K (₹ / 10 g)", "Gold", "916", 10.0),
-    ("gold_750", "Gold 750 / 18K (₹ / 10 g)", "Gold", "750", 10.0),
-    ("gold_585", "Gold 585 / 14K (₹ / 10 g)", "Gold", "585", 10.0),
-    ("silver_999", "Silver 999 (₹ / kg)", "Silver", "999", 1000.0),
-    ("silver_925", "Silver 925 (₹ / kg)", "Silver", "925", 1000.0),
+    ("gold_999", "Gold 999 base (₹ / 10 g)", "Gold", "999", 10.0),
+    ("gold_995", "Gold 995 override (optional; blank = derive)", "Gold", "995", 10.0),
+    ("gold_916", "Gold 916 / 22K override (optional; blank = derive)", "Gold", "916", 10.0),
+    ("gold_750", "Gold 750 / 18K override (optional; blank = derive)", "Gold", "750", 10.0),
+    ("gold_585", "Gold 585 / 14K override (optional; blank = derive)", "Gold", "585", 10.0),
+    ("silver_999", "Silver 999 base (₹ / kg)", "Silver", "999", 1000.0),
+    ("silver_925", "Silver 925 override (optional; blank = derive)", "Silver", "925", 1000.0),
 )
 
 
@@ -57,13 +57,14 @@ class RateManagerPanel(ttk.Frame):
         actions = ttk.Frame(hero, style="Surface.TFrame")
         actions.pack(fill="x")
         ttk.Button(actions, text="Set / update shop rates", style="Primary.TButton", command=self.manual_update).pack(side="left")
-        ttk.Button(actions, text="Sync reference", style="Secondary.TButton", command=self.sync_reference).pack(side="left", padx=5)
-        ttk.Button(actions, text="Provider settings", style="Secondary.TButton", command=self.provider_settings).pack(side="left")
+        ttk.Button(actions, text="Confirm current unchanged", style="Secondary.TButton", command=self.confirm_unchanged).pack(side="left", padx=5)
+        ttk.Button(actions, text="Sync reference", style="Secondary.TButton", command=self.sync_reference).pack(side="left")
+        ttk.Button(actions, text="Provider settings", style="Secondary.TButton", command=self.provider_settings).pack(side="left", padx=5)
         ttk.Button(actions, text="Refresh", style="Secondary.TButton", command=self.refresh).pack(side="right")
 
         ttk.Label(
             hero,
-            text="Rate history is append-only: changing today's rate creates a new effective rate instead of rewriting yesterday's bills. External feeds are reference-only until you approve them.",
+            text="Rate history is append-only. Set the 999 base rate and JewelLAN derives other purities unless you deliberately enter a purity-specific override. External feeds are reference-only until you approve them.",
             style="SurfaceMuted.TLabel",
             wraplength=1050,
         ).pack(anchor="w", pady=(9, 0))
@@ -164,7 +165,10 @@ class RateManagerPanel(ttk.Frame):
         fields = []
         for key, label, metal, purity, divisor in RATE_FIELDS:
             row = lookup.get((metal, purity))
-            defaults[key] = f"{_n(row.get('rate_per_gram')) * divisor:.2f}" if row else ""
+            # Only base rates are prefilled. Purity overrides stay blank on purpose;
+            # otherwise yesterday's direct 916/925 rate could be copied into today's
+            # batch and silently defeat a newly entered 999 base rate.
+            defaults[key] = f"{_n(row.get('rate_per_gram')) * divisor:.2f}" if row and purity == "999" else ""
             fields.append((key, label))
         fields.append(("note", "Reason / note"))
         data = form_dialog(self, "Set current shop metal rates", fields, defaults)
@@ -185,6 +189,34 @@ class RateManagerPanel(ttk.Frame):
             self.api.post("/api/rate-management/apply", {"source": "manual", "note": data.get("note", ""), "rates": rates})
             messagebox.showinfo("Metal rates", "New shop rates are active. Previous rate history was preserved.", parent=self)
             self.refresh()
+        except Exception as exc:
+            self.admin.app.error(exc)
+
+    def confirm_unchanged(self):
+        base_rows = []
+        seen = set()
+        for row in self.snapshot.get("rates", []):
+            metal = str(row.get("metal") or "")
+            purity = str(row.get("purity") or "")
+            if purity != "999" or metal in seen:
+                continue
+            value = _n(row.get("rate_per_gram"))
+            if value > 0:
+                base_rows.append({"metal": metal, "purity": "999", "rate_per_gram": value})
+                seen.add(metal)
+        if not base_rows:
+            self.admin.app.error("No current base rate is available to confirm. Set the shop rate first.")
+            return
+        if not messagebox.askyesno(
+            "Confirm unchanged rates",
+            "Confirm the currently resolved base rates for today's business date?\n\nThis creates a new dated rate record; it does not rewrite earlier rate history.",
+            parent=self,
+        ):
+            return
+        try:
+            self.api.post("/api/rate-management/apply", {"source": "manual", "note": "Confirmed current rates unchanged", "rates": base_rows})
+            self.refresh()
+            messagebox.showinfo("Metal rates", "Today's shop rates are confirmed.", parent=self)
         except Exception as exc:
             self.admin.app.error(exc)
 
