@@ -15,7 +15,7 @@ from .security import require
 APP_VERSION = "1.2.0-rc6"
 TROY_OUNCE_GRAMS = Decimal("31.1034768")
 RATE_PROVIDERS = {"manual", "ibja", "goldapi"}
-WRITE_ROLES = {"admin", "manager", "inventory"}
+WRITE_ROLES = {"admin", "manager"}
 STANDARD_RATE_TARGETS = (
     ("Gold", "999"),
     ("Gold", "995"),
@@ -77,7 +77,7 @@ def _normal_purity(value: Any) -> str:
 
 def _ensure_write_role(user: dict[str, Any]) -> None:
     if user.get("role") not in WRITE_ROLES:
-        raise HTTPException(403, "Only an administrator, manager, or inventory controller can change shop metal rates")
+        raise HTTPException(403, "Only an administrator or manager can change shop metal rates")
 
 
 def _business_date_for_timestamp(value: str, offset_minutes: int) -> str:
@@ -155,15 +155,22 @@ def current_rate_snapshot(conn) -> dict[str, Any]:
         (_normal_metal(r["metal"]), _normal_purity(r["purity"]))
         for r in conn.execute("SELECT DISTINCT metal,purity FROM metal_rates").fetchall()
     }
+    active_metals = sorted({metal for metal, _purity in db_pairs})
     pairs = list(dict.fromkeys((*STANDARD_RATE_TARGETS, *sorted(db_pairs))))
     rates = []
-    newest_business_date = ""
+    metal_dates: dict[str, str] = {}
+    for metal in active_metals:
+        newest = conn.execute(
+            "SELECT effective_at FROM metal_rates WHERE lower(metal)=lower(?) ORDER BY effective_at DESC,id DESC LIMIT 1",
+            (metal,),
+        ).fetchone()
+        if newest:
+            metal_dates[metal] = _business_date_for_timestamp(str(newest["effective_at"]), offset)
     for metal, purity in pairs:
         row = resolve_rate_row(conn, metal, purity)
         if not row:
             continue
         row_date = _business_date_for_timestamp(str(row.get("effective_at") or ""), offset)
-        newest_business_date = max(newest_business_date, row_date)
         rates.append({
             "metal": metal,
             "purity": purity,
@@ -174,10 +181,15 @@ def current_rate_snapshot(conn) -> dict[str, Any]:
             "derived": bool(row.get("derived")),
             "source_rate_id": row.get("id"),
         })
+    stale_metals = [metal for metal in active_metals if metal_dates.get(metal) != today]
+    dates = list(metal_dates.values())
     return {
         "business_date": today,
-        "last_rate_business_date": newest_business_date or None,
-        "updated_today": bool(newest_business_date == today),
+        "last_rate_business_date": min(dates) if dates else None,
+        "updated_today": bool(active_metals) and not stale_metals,
+        "active_metals": active_metals,
+        "metal_dates": metal_dates,
+        "stale_metals": stale_metals,
         "rates": rates,
     }
 
@@ -341,6 +353,8 @@ def rate_settings_save(payload: dict = Body(...), user=Depends(require("rates"))
 
 @router.post("/sync-preview")
 def rate_sync_preview(payload: dict = Body(default={}), user=Depends(require("rates"))):
+    if user.get("role") not in {"admin", "manager"}:
+        raise HTTPException(403, "Administrator or manager permission is required to sync reference rates")
     provider = str(payload.get("provider") or "").strip().lower()
     with read_db() as conn:
         settings = get_settings(conn)
@@ -389,19 +403,67 @@ def rate_apply(payload: dict = Body(...), user=Depends(require("rates"))):
     return {"ok": True, "effective_at": effective_at, "ids": ids, "source": source, "current": snapshot}
 
 
+def _dashboard_with_resolved_rates(main_module):
+    original = main_module.dashboard
+
+    def dashboard(u):
+        data = original(u)
+        with read_db() as conn:
+            snapshot = current_rate_snapshot(conn)
+        data["rates"] = [
+            {
+                "metal": row["metal"],
+                "purity": row["purity"],
+                "rate_per_gram": row["rate_per_gram"],
+                "effective_at": row["effective_at"],
+                "derived": row["derived"],
+                "source_purity": row["source_purity"],
+            }
+            for row in snapshot["rates"]
+        ]
+        data["rate_status"] = {
+            "updated_today": snapshot["updated_today"],
+            "stale_metals": snapshot["stale_metals"],
+            "metal_dates": snapshot["metal_dates"],
+        }
+        return data
+
+    main_module.dashboard = dashboard
+    for route in main_module.app.routes:
+        if getattr(route, "path", None) == "/api/dashboard" and "GET" in getattr(route, "methods", set()):
+            route.endpoint = dashboard
+            route.dependant.call = dashboard
+            break
+
+
+def _guard_legacy_rate_post(main_module):
+    original = main_module.add_rate
+
+    def guarded(p, u):
+        _ensure_write_role(u)
+        return original(p, u)
+
+    main_module.add_rate = guarded
+    for route in main_module.app.routes:
+        if getattr(route, "path", None) == "/api/rates" and "POST" in getattr(route, "methods", set()):
+            route.endpoint = guarded
+            route.dependant.call = guarded
+            break
+
+
 def install_rate_management(main_module) -> None:
-    """Install the RC6 rate workflow without breaking the legacy /api/rates API."""
+    """Install RC6 rate workflow while retaining compatible /api/rates history."""
     app = main_module.app
     if getattr(app.state, "rate_management_installed", False):
         return
     app.include_router(router)
-    app.state.rate_management_installed = True
 
-    # The legacy pricing engine resolves this global at runtime, so replacing it
-    # upgrades every quote/sale while keeping the proven calculation code intact.
     from . import services
 
     services.latest_rate = latest_rate
     main_module.latest_rate = latest_rate
+    _dashboard_with_resolved_rates(main_module)
+    _guard_legacy_rate_post(main_module)
     main_module.APP_VERSION = APP_VERSION
     app.version = APP_VERSION
+    app.state.rate_management_installed = True
