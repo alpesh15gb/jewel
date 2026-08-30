@@ -19,6 +19,7 @@ def self_test() -> int:
         "jewel_client.ui_theme",
         "jewel_client.returns_page",
         "jewel_client.billing_page",
+        "jewel_client.rate_panel",
     )
     missing = [name for name in required if importlib.util.find_spec(name) is None]
     if missing:
@@ -27,6 +28,7 @@ def self_test() -> int:
     from jewel_client.api import Api, discover_servers  # noqa: F401
     from jewel_client.billing_page import POSPage  # noqa: F401
     from jewel_client.config import load_config, save_config  # noqa: F401
+    from jewel_client.rate_panel import RateManagerPanel  # noqa: F401
     from jewel_client.scale import read_scale  # noqa: F401
 
     return 0
@@ -55,17 +57,14 @@ def _crash_log(exc: BaseException) -> Path:
     return path
 
 
-def _install_enhanced_billing_page():
-    """Replace the legacy billing page before App builds navigation.
-
-    Keeping this registration in the executable entry point lets the new billing
-    screen ship independently while the larger legacy desktop module is gradually
-    decomposed into smaller pages.
-    """
+def _install_client_enhancements():
+    """Install the audited billing page and jewellery-specific daily-rate workflow."""
     import jewel_client.main as main_module
     from jewel_client.billing_page import POSPage as BillingPOSPage
+    from jewel_client.rate_panel import install_rate_ui
 
     main_module.POSPage = BillingPOSPage
+    install_rate_ui(main_module)
     return main_module
 
 
@@ -76,7 +75,7 @@ def launch() -> None:
     from jewel_client.api import Api
     from jewel_client.config import load_config
 
-    main_module = _install_enhanced_billing_page()
+    main_module = _install_client_enhancements()
     App = main_module.App
     LoginDialog = main_module.LoginDialog
     ensure_company_setup = main_module.ensure_company_setup
