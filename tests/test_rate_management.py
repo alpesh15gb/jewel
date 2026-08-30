@@ -98,7 +98,7 @@ def test_ibja_parser_uses_latest_date_and_pm_session_and_converts_indian_units()
 
 
 def test_ibja_invalid_payload_is_rejected():
-    with pytest.raises(ValueError, match="token|rejected"):
+    with pytest.raises(ValueError, match="(?i)token|rejected"):
         rm.parse_ibja_response([{"status": "invalid", "message": "Access Token Is Blank"}])
 
 
@@ -109,7 +109,7 @@ def test_rate_management_installs_router_pricing_dashboard_and_guard_once():
     rm.install_rate_management(main_module)
     rm.install_rate_management(main_module)
 
-    paths = [route.path for route in main_module.app.routes]
+    paths = [getattr(route, "path", None) for route in main_module.app.routes]
     assert paths.count("/api/rate-management/current") == 1
     assert paths.count("/api/rate-management/apply") == 1
     assert services.latest_rate is rm.latest_rate
