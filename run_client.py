@@ -18,12 +18,14 @@ def self_test() -> int:
         "jewel_client.scale",
         "jewel_client.ui_theme",
         "jewel_client.returns_page",
+        "jewel_client.billing_page",
     )
     missing = [name for name in required if importlib.util.find_spec(name) is None]
     if missing:
         return 2
 
     from jewel_client.api import Api, discover_servers  # noqa: F401
+    from jewel_client.billing_page import POSPage  # noqa: F401
     from jewel_client.config import load_config, save_config  # noqa: F401
     from jewel_client.scale import read_scale  # noqa: F401
 
@@ -34,7 +36,7 @@ def _prepare_setup_parent(root) -> None:
     """Map the Tk root before creating transient post-login setup dialogs.
 
     On Windows, a Toplevel marked transient to a withdrawn root can disappear when
-    the login window is destroyed.  Company/password setup happens before the main
+    the login window is destroyed. Company/password setup happens before the main
     App frame exists, so keep a tiny mapped root alive as the modal owner.
     """
     root.deiconify()
@@ -53,18 +55,32 @@ def _crash_log(exc: BaseException) -> Path:
     return path
 
 
+def _install_enhanced_billing_page():
+    """Replace the legacy billing page before App builds navigation.
+
+    Keeping this registration in the executable entry point lets the new billing
+    screen ship independently while the larger legacy desktop module is gradually
+    decomposed into smaller pages.
+    """
+    import jewel_client.main as main_module
+    from jewel_client.billing_page import POSPage as BillingPOSPage
+
+    main_module.POSPage = BillingPOSPage
+    return main_module
+
+
 def launch() -> None:
     import tkinter as tk
     from tkinter import messagebox
 
     from jewel_client.api import Api
     from jewel_client.config import load_config
-    from jewel_client.main import (
-        App,
-        LoginDialog,
-        ensure_company_setup,
-        force_initial_password_change,
-    )
+
+    main_module = _install_enhanced_billing_page()
+    App = main_module.App
+    LoginDialog = main_module.LoginDialog
+    ensure_company_setup = main_module.ensure_company_setup
+    force_initial_password_change = main_module.force_initial_password_change
 
     root = tk.Tk()
     root.withdraw()
@@ -78,7 +94,7 @@ def launch() -> None:
             root.destroy()
             return
 
-        # The login Toplevel is now gone.  Map the owner before opening password or
+        # The login Toplevel is now gone. Map the owner before opening password or
         # company setup, otherwise Windows can hide transient children with it.
         _prepare_setup_parent(root)
 
