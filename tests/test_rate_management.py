@@ -1,6 +1,7 @@
 import sqlite3
 
 import pytest
+from fastapi import HTTPException
 
 from jewel_server import rate_management as rm
 
@@ -19,6 +20,8 @@ def rate_db():
         rate_paise_per_gram INTEGER
         )"""
     )
+    conn.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)")
+    conn.execute("INSERT INTO settings VALUES('business_timezone_offset_minutes','330','2026-08-30T00:00:00+00:00')")
     return conn
 
 
@@ -57,6 +60,24 @@ def test_same_batch_exact_purity_rate_wins():
     assert row["rate_per_gram"] == pytest.approx(6500)
 
 
+def test_daily_confirmation_is_per_metal_not_global(monkeypatch):
+    conn = rate_db()
+    monkeypatch.setattr(rm, "business_date", lambda _conn: "2026-08-30")
+    add_rate(conn, "Gold", "999", 7000, "2026-08-30T04:00:00+00:00")
+    add_rate(conn, "Silver", "999", 90, "2026-08-29T04:00:00+00:00")
+
+    stale = rm.current_rate_snapshot(conn)
+    assert stale["updated_today"] is False
+    assert stale["stale_metals"] == ["Silver"]
+    assert stale["metal_dates"]["Gold"] == "2026-08-30"
+    assert stale["metal_dates"]["Silver"] == "2026-08-29"
+
+    add_rate(conn, "Silver", "999", 92, "2026-08-30T04:05:00+00:00")
+    current = rm.current_rate_snapshot(conn)
+    assert current["updated_today"] is True
+    assert current["stale_metals"] == []
+
+
 def test_ibja_parser_uses_latest_date_and_pm_session_and_converts_indian_units():
     payload = [
         {"RateDate": "29/08/2026", "RateTime": "6PM", "Purity": "999", "GoldRate": "150000", "SilverRate": "230000"},
@@ -81,7 +102,7 @@ def test_ibja_invalid_payload_is_rejected():
         rm.parse_ibja_response([{"status": "invalid", "message": "Access Token Is Blank"}])
 
 
-def test_rate_management_installs_router_and_pricing_resolver_once():
+def test_rate_management_installs_router_pricing_dashboard_and_guard_once():
     import jewel_server.main as main_module
     from jewel_server import services
 
@@ -94,3 +115,7 @@ def test_rate_management_installs_router_and_pricing_resolver_once():
     assert services.latest_rate is rm.latest_rate
     assert main_module.latest_rate is rm.latest_rate
     assert main_module.APP_VERSION == "1.2.0-rc6"
+
+    with pytest.raises(HTTPException) as exc:
+        main_module.add_rate({"metal": "Gold", "purity": "999", "rate_per_gram": 7000}, {"role": "accounts"})
+    assert exc.value.status_code == 403
