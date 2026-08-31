@@ -39,10 +39,10 @@ def test_health_login_inventory_sale_and_audit():
         item = {"name": "22K Ring", "category": "Ring", "metal": "Gold", "purity": "916", "gross_weight": 10.0, "stone_weight": 1.0, "net_weight": 9.0, "making_type": "per_gram", "making_value": 500, "stone_value": 1000, "cost_amount": 40000, "huid": "ABC123"}
         r = c.post("/api/items", headers=h, json=item); assert r.status_code == 200, r.text
         it = r.json(); assert it["net_weight"] == 9.0
-        assert c.get(f"/api/items/barcode/{it['barcode']}", headers=h).status_code == 200
-        q = c.post("/api/sales/quote", headers=h, json={"lines": [{"item_id": it["id"]}], "discount": 0, "old_gold": []}); assert q.status_code == 200, q.text
+        assert c.get(f"/api/items/barcode/{it['barcode']}", headers=h, params={"branch_id":1,"counter_id":1}).status_code == 200
+        q = c.post("/api/sales/quote", headers=h, json={"lines": [{"item_id": it["id"], "item_version":it["version"]}], "discount": 0, "old_gold": [], "branch_id":1, "counter_id":1}); assert q.status_code == 200, q.text
         quote = q.json(); assert quote["total"] > 0
-        payload = {"client_request_id": str(uuid.uuid4()), "branch_id": 1, "counter_id": 1, "lines": [{"item_id": it["id"]}], "discount": 0, "old_gold": [], "payment_cash": quote["total"], "payment_card": 0, "payment_upi": 0, "payment_credit": 0}
+        payload = {"client_request_id": str(uuid.uuid4()), "branch_id": 1, "counter_id": 1, "lines": [{"item_id": it["id"], "item_version":it["version"]}], "discount": 0, "old_gold": [], "payment_cash": quote["total"], "payment_card": 0, "payment_upi": 0, "payment_credit": 0, "quote_hash":quote["quote_hash"]}
         sale = c.post("/api/sales", headers=h, json=payload); assert sale.status_code == 200, sale.text
         sid = sale.json()["id"]
         retry = c.post("/api/sales", headers=h, json=payload); assert retry.status_code == 200; assert retry.json()["id"] == sid; assert retry.json()["idempotent"] is True
