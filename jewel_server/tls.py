@@ -100,7 +100,6 @@ def generate_server_certificate() -> tuple[Path, Path]:
     cert_tmp = cert.with_suffix(".tmp")
     key_tmp.write_bytes(private_key.private_bytes(encoding=serialization.Encoding.PEM,format=serialization.PrivateFormat.TraditionalOpenSSL,encryption_algorithm=serialization.NoEncryption()))
     cert_tmp.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
-    _restrict_private_key(key_tmp)
     os.replace(key_tmp, key)
     os.replace(cert_tmp, cert)
     _restrict_private_key(key)
