@@ -5,9 +5,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .db import audit, business_date, business_now, next_sequence, utcnow
+from .db import audit, business_date, business_now, day_is_closed, next_sequence, request_fingerprint, utcnow
 from .precision import money, money_paise
-from .services import _journal
+from .services import _journal, _record_payments
 from .tally import enqueue_tally
 
 
@@ -117,9 +117,12 @@ def quote_sale_return(conn, sale_id: int, sale_item_ids: list[int] | None = None
 
 def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str, Any], client_ip: str | None = None) -> dict[str, Any]:
     req = str(payload.get("client_request_id") or "").strip() or None
+    fingerprint = request_fingerprint("sale_return", payload)
     if req:
-        old = conn.execute("SELECT id FROM sale_returns WHERE client_request_id=?", (req,)).fetchone()
+        old = conn.execute("SELECT id,request_fingerprint FROM sale_returns WHERE client_request_id=?", (req,)).fetchone()
         if old:
+            if old["request_fingerprint"] and old["request_fingerprint"] != fingerprint:
+                raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different return data","request_id":req})
             return _return_payload(conn, int(old["id"])) | {"idempotent": True}
 
     reason = str(payload.get("reason") or "").strip()
@@ -131,6 +134,8 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
     sale = dict(sale_row)
     if sale["status"] != "posted":
         raise HTTPException(409, "Cancelled invoices cannot be returned")
+    if day_is_closed(conn, int(sale["branch_id"]), str(sale.get("business_date") or business_date(conn))):
+        raise HTTPException(409, detail={"code":"DAY_CLOSED","message":"Returns cannot be posted after day close"})
 
     requested = payload.get("sale_item_ids") or []
     try:
@@ -154,6 +159,9 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
         raise HTTPException(409, "One or more selected invoice items have already been returned")
 
     allocations = _round_off_allocations(conn, sale_id)
+    dispositions = payload.get("dispositions") if isinstance(payload.get("dispositions"), dict) else {}
+    default_disposition = str(payload.get("disposition") or "in_stock").strip().lower()
+    allowed_dispositions = {"in_stock", "damaged", "scrap"}
     taxable_paise = 0
     gst_paise = 0
     round_off_paise = 0
@@ -165,6 +173,9 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
         item = conn.execute("SELECT status FROM items WHERE id=?", (line["item_id"],)).fetchone()
         if not item or item["status"] != "sold":
             raise HTTPException(409, f"Tag {line['tag_no']} is not currently sold and cannot be returned")
+        disposition = str(dispositions.get(str(line_id), dispositions.get(line_id, default_disposition))).strip().lower()
+        if disposition not in allowed_dispositions:
+            raise HTTPException(400, "Return disposition must be in_stock, damaged, or scrap")
         ro = int(allocations.get(line_id, 0))
         taxable = int(line["taxable_paise"] or 0)
         gst = int(line["gst_amount_paise"] or 0)
@@ -172,7 +183,7 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
         cost = int(line["cost_amount_paise"] or 0)
         if line_total < 0:
             raise HTTPException(409, "Stored invoice line is invalid")
-        selected.append((line, taxable, gst, ro, line_total, cost))
+        selected.append((line, taxable, gst, ro, line_total, cost, disposition))
         taxable_paise += taxable
         gst_paise += gst
         round_off_paise += ro
@@ -196,37 +207,45 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
     ret_no = next_sequence(conn, "return", "CN-" + business_now(conn).strftime("%y%m") + "-", 6)
     cur = conn.execute(
         """INSERT INTO sale_returns(
-             return_no,client_request_id,sale_id,customer_id,branch_id,business_date,
+             return_no,client_request_id,request_fingerprint,print_snapshot_json,sale_id,customer_id,branch_id,business_date,
              taxable_paise,gst_paise,cgst_paise,sgst_paise,igst_paise,round_off_paise,total_paise,
              refund_cash_paise,refund_card_paise,refund_upi_paise,refund_credit_paise,
              reason,status,user_id,created_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'posted',?,?)""",
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posted',?,?)""",
         (
-            ret_no,req,sale_id,sale.get("customer_id"),sale["branch_id"],business_date(conn),
+            ret_no,req,fingerprint,sale.get("print_snapshot_json") or "{}",sale_id,sale.get("customer_id"),sale["branch_id"],business_date(conn),
             taxable_paise,gst_paise,cgst_paise,sgst_paise,igst_paise,round_off_paise,total_paise,
             refund_cash,refund_card,refund_upi,refund_credit,reason,user["id"],now,
         ),
     )
     return_id = int(cur.lastrowid)
+    refs = payload.get("refund_references") if isinstance(payload.get("refund_references"), dict) else {}
+    _record_payments(conn, "sale_return", return_id, [
+        ("cash", refund_cash, "1000", refs.get("cash")),
+        ("card", refund_card, "1010", refs.get("card")),
+        ("upi", refund_upi, "1010", refs.get("upi")),
+        ("credit", refund_credit, "1100", refs.get("credit")),
+    ], user["id"], now, direction="out")
 
-    for line, taxable, gst, ro, line_total, cost in selected:
+    for line, taxable, gst, ro, line_total, cost, disposition in selected:
         conn.execute(
-            """INSERT INTO sale_return_items(
+        """INSERT INTO sale_return_items(
                  return_id,sale_item_id,item_id,tag_no,taxable_paise,gst_amount_paise,
-                 round_off_paise,line_total_paise,cost_amount_paise,active
-               ) VALUES(?,?,?,?,?,?,?,?,?,1)""",
-            (return_id,line["id"],line["item_id"],line["tag_no"],taxable,gst,ro,line_total,cost),
+                 round_off_paise,line_total_paise,cost_amount_paise,active,disposition
+               ) VALUES(?,?,?,?,?,?,?,?,?,1,?)""",
+            (return_id,line["id"],line["item_id"],line["tag_no"],taxable,gst,ro,line_total,cost,disposition),
         )
+        target_status = disposition
         updated = conn.execute(
-            "UPDATE items SET status='in_stock',version=version+1,updated_at=? WHERE id=? AND status='sold'",
-            (now, line["item_id"]),
+            "UPDATE items SET status=?,version=version+1,updated_at=? WHERE id=? AND status='sold'",
+            (target_status, now, line["item_id"]),
         )
         if updated.rowcount != 1:
             raise HTTPException(409, f"Tag {line['tag_no']} changed on another counter")
         conn.execute(
             """INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at)
                VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (line["item_id"],"sale_return","sale_return",return_id,"customer",f"branch:{sale['branch_id']}",line["gross_weight"],user["id"],ret_no,now),
+            (line["item_id"],"sale_return","sale_return",return_id,"customer",f"branch:{sale['branch_id']}",line["gross_weight"],user["id"],f"{ret_no}:{disposition}",now),
         )
 
     _adjust_customer_balance(conn, sale.get("customer_id"), -refund_credit, now)
@@ -269,11 +288,14 @@ def cancel_sale_return(conn, return_id: int, user: dict[str, Any], reason: str, 
     reason = str(reason or "").strip()
     if len(reason) < 3:
         raise HTTPException(400, "Cancellation reason is required")
+    if day_is_closed(conn, int(ret["branch_id"]), str(ret.get("business_date") or business_date(conn))):
+        raise HTTPException(409, detail={"code": "DAY_CLOSED", "message": "Credit notes cannot be cancelled after day close"})
     now = utcnow()
     lines = conn.execute("SELECT * FROM sale_return_items WHERE return_id=? AND active=1", (return_id,)).fetchall()
     for line in lines:
         item = conn.execute("SELECT status FROM items WHERE id=?", (line["item_id"],)).fetchone()
-        if not item or item["status"] != "in_stock":
+        disposition = str(line["disposition"] or "in_stock")
+        if not item or item["status"] != disposition:
             raise HTTPException(409, f"Cannot cancel return: tag {line['tag_no']} has already moved from stock")
     for line in lines:
         conn.execute("UPDATE items SET status='sold',version=version+1,updated_at=? WHERE id=?", (now,line["item_id"]))

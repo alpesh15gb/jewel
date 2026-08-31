@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from .api import Api, ApiError, discover_servers, format_fingerprint, probe_server_fingerprint, secure_url
-from .config import load_config, save_config
+from .config import load_config, load_pending_posts, remove_pending_post, save_config, save_pending_posts
 from .scale import read_scale
 from .ui_theme import PALETTE, apply_theme, card, divider, status_pill
 from .returns_page import ReturnsPage
@@ -240,6 +240,49 @@ class Page(ttk.Frame):
     def toolbar(self):
         f = ttk.Frame(self); f.pack(fill="x", pady=(0, 10)); return f
 
+
+class PendingPostsPage(Page):
+    """Reconcile financial writes whose network outcome was unknown."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, app)
+        self.heading("Pending Posts", "Reconcile timed-out financial writes before retrying. Never create a second request for the same operation.")
+        bar=ttk.Frame(self);bar.pack(fill="x",pady=(0,10))
+        ttk.Button(bar,text="Refresh",style="Secondary.TButton",command=self.refresh).pack(side="left")
+        ttk.Button(bar,text="Reconcile selected",style="Primary.TButton",command=self.reconcile).pack(side="left",padx=6)
+        self.status=tk.StringVar(value="")
+        ttk.Label(bar,textvariable=self.status,style="Muted.TLabel").pack(side="left",padx=10)
+        box=ttk.Frame(self);box.pack(fill="both",expand=True)
+        self.t=self.tree(box,("request_id","operation","state","created_at","error"),{"request_id":260,"operation":100,"state":150,"created_at":160,"error":430})
+        self.refresh()
+
+    def refresh(self):
+        self.t.delete(*self.t.get_children())
+        posts=load_pending_posts()
+        for row in posts:
+            self.t.insert("","end",iid=str(row.get("request_id") or ""),values=(row.get("request_id",""),row.get("operation",""),row.get("state",""),row.get("created_at",""),row.get("error","") or ""))
+        self.status.set(f"{len(posts)} pending operation" + ("" if len(posts)==1 else "s"))
+
+    def reconcile(self):
+        selection=self.t.selection()
+        if not selection:return
+        request_id=selection[0]
+        row=next((x for x in load_pending_posts() if str(x.get("request_id"))==request_id),None)
+        if not row:return self.refresh()
+        operation=str(row.get("operation") or "")
+        try:
+            result=self.api.get(f"/api/operations/reconcile/{operation}/{request_id}")
+            if result.get("state")=="confirmed":
+                remove_pending_post(request_id)
+                messagebox.showinfo("Operation confirmed",f"The server already confirmed {operation}: {result.get('reference') or result.get('id')}",parent=self)
+            elif result.get("safe_to_retry"):
+                row["state"]="pending";row["error"]="Server found no matching operation; retry the original request when ready.";save_pending_posts([row if str(x.get("request_id"))==request_id else x for x in load_pending_posts()])
+                messagebox.showinfo("Safe to retry","No matching server record was found. The original request is preserved and may be retried.",parent=self)
+            else:
+                messagebox.showwarning("Reconciliation pending",str(result),parent=self)
+            self.refresh()
+        except Exception as exc:self.app.error(exc)
+
 class App(ttk.Frame):
     def __init__(self, root, api, cfg, user):
         apply_theme(root)
@@ -259,7 +302,7 @@ class App(ttk.Frame):
         self.company_label=ttk.Label(nav, text=self.settings.get("business_name") or "Company not configured", style="NavMuted.TLabel", wraplength=180);self.company_label.pack(anchor="w", padx=18, pady=(0, 18))
 
         role = self.user.get("role", "cashier")
-        pages = [("Overview", DashboardPage), ("Inventory", InventoryPage), ("Parties", PartiesPage)]
+        pages = [("Overview", DashboardPage), ("Pending Posts", PendingPostsPage), ("Inventory", InventoryPage), ("Parties", PartiesPage)]
         if role in ("admin","manager","cashier"): pages.insert(1, ("Billing", POSPage))
         if role in ("admin","manager"): pages.insert(2, ("Returns & Credit Notes", ReturnsPage))
         if role in ("admin","manager","inventory"): pages.append(("Purchases", PurchasesPage))
@@ -364,6 +407,8 @@ class InventoryPage(Page):
     def __init__(self,parent,app):
         super().__init__(parent,app); self.heading("Inventory & Tagging", "Serialized jewellery with barcode, HUID, weights and movement-safe status.")
         bar=ttk.Frame(self);bar.pack(fill="x");self.q=tk.StringVar();e=ttk.Entry(bar,textvariable=self.q);e.pack(side="left",fill="x",expand=True);e.bind("<Return>",lambda _:self.refresh());ttk.Button(bar,text="Search",command=self.refresh).pack(side="left",padx=4);ttk.Button(bar,text="Add",command=self.add).pack(side="left");ttk.Button(bar,text="Edit",command=self.edit).pack(side="left",padx=4);ttk.Button(bar,text="Print tag",command=self.print_tag).pack(side="left")
+        if app.user.get("role") in ("admin", "manager"):
+            ttk.Button(bar,text="Opening stock",style="Secondary.TButton",command=self.opening_stock).pack(side="left",padx=(8,0))
         h=ttk.Frame(self);h.pack(fill="both",expand=True,pady=8);self.t=self.tree(h,self.COLS,{"name":180,"tag_no":120});self.refresh()
     def refresh(self):
         try:r=self.api.get("/api/items",q=self.q.get(),limit=1000)
@@ -395,12 +440,23 @@ class InventoryPage(Page):
         else:d['net_weight']=expected
         huid=str(d.get('huid') or '').strip().upper();d['huid']=huid
         if huid and (len(huid)!=6 or not huid.isalnum()):raise RuntimeError('HUID must be exactly six letters/numbers, for example ABC123')
-        d["branch_id"]=int(self.app.cfg.get("branch_id",1));d["counter_id"]=self.app.cfg.get("counter_id") or None;return d
+        d["branch_id"]=int(self.app.cfg.get("branch_id",1));d["counter_id"]=self.app.cfg.get("counter_id") or None
+        if original.get("version") is not None:d["expected_version"]=int(original["version"])
+        return d
 
     def add(self):
         try:
             d=self.values();
             if d:r=self.api.post("/api/items",d);self.refresh();messagebox.showinfo("Inventory",f"Created {r['tag_no']}",parent=self)
+        except Exception as e:self.app.error(e)
+    def opening_stock(self):
+        try:
+            d=self.values()
+            if not d:return
+            reference=simpledialog.askstring("Opening stock","Reference or opening-stock batch name:",initialvalue="Opening stock",parent=self)
+            if not reference:return
+            r=self.api.post("/api/opening-stock",{"branch_id":d.pop("branch_id"),"counter_id":d.pop("counter_id"),"reference":reference,"items":[d]})
+            self.refresh();messagebox.showinfo("Opening stock",f"Recorded {r['item_count']} item(s) with journal {r['journal_id']}.",parent=self)
         except Exception as e:self.app.error(e)
     def edit(self):
         iid=self.selected();

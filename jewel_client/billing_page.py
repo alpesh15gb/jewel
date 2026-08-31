@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import uuid
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
+from .api import ApiError
+from .config import remove_pending_post, upsert_pending_post
 from .main import Page, form_dialog, money, open_pdf
 from .ui_theme import card, divider, status_pill
 
@@ -411,7 +413,13 @@ class POSPage(Page):
         try:
             self.quote = self.api.post(
                 "/api/sales/quote",
-                {"lines": self.lines, "discount": discount, "old_gold": self.old},
+                {
+                    "lines": self.lines,
+                    "discount": discount,
+                    "old_gold": self.old,
+                    "branch_id": int(self.app.cfg.get("branch_id", 1)),
+                    "counter_id": self.app.cfg.get("counter_id") or None,
+                },
             )
             self.discount_hint.set("Discount applied to the live quote.")
             self.render()
@@ -526,12 +534,15 @@ class POSPage(Page):
         self.requote()
         if not self.quote:
             return
+        body = {}
+        posted = False
         try:
             index = self.customer.current()
             customer_id = self.customers[index - 1]["id"] if index > 0 else None
             payments = {key: float(var.get() or 0) for key, var in self.pay.items()}
+            request_id = str(uuid.uuid4())
             body = {
-                "client_request_id": str(uuid.uuid4()),
+                "client_request_id": request_id,
                 "branch_id": int(self.app.cfg.get("branch_id", 1)),
                 "counter_id": self.app.cfg.get("counter_id") or None,
                 "customer_id": customer_id,
@@ -542,14 +553,24 @@ class POSPage(Page):
                 "payment_card": payments["card"],
                 "payment_upi": payments["upi"],
                 "payment_credit": payments["credit"],
+                "quote_id": self.quote.get("quote_id"),
+                "quote_version": self.quote.get("quote_version"),
+                "quote_hash": self.quote.get("quote_hash"),
             }
+            upsert_pending_post({
+                "request_id": request_id,
+                "operation": "sale",
+                "state": "submitting",
+                "created_at": uuid.uuid1().time,
+                "payload": body,
+            })
             result = self.api.post("/api/sales", body)
+            posted = True
+            remove_pending_post(request_id)
             open_pdf(
                 self.api.request("GET", f"/api/sales/{result['id']}/invoice.pdf"),
                 f"{result['invoice_no']}.pdf",
             )
-            from tkinter import messagebox
-
             messagebox.showinfo(
                 "Sale completed",
                 f"{result['invoice_no']}\n{money(result['total'])}",
@@ -563,5 +584,19 @@ class POSPage(Page):
                 value.set("0")
             self.render()
             self.scan_entry.focus_set()
+        except ApiError as exc:
+            if not posted and (exc.status == 0 or exc.code == "CONNECTIVITY_UNKNOWN"):
+                upsert_pending_post({
+                    "request_id": body.get("client_request_id", ""),
+                    "operation": "sale",
+                    "state": "outcome_unknown",
+                    "created_at": body.get("created_at", ""),
+                    "payload": body,
+                    "error": str(exc),
+                })
+                messagebox.showwarning("Sale outcome unknown", "The server may have posted this invoice. Do not create a new sale. Open Pending Posts and reconcile this request.", parent=self)
+            else:
+                remove_pending_post(body.get("client_request_id", ""))
+                self.app.error(exc)
         except Exception as exc:
             self.app.error(exc)

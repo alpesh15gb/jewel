@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
 PRODUCTION_HARDENED_V1 = True
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 
 def app_data_dir() -> Path:
@@ -53,7 +54,9 @@ def business_date(conn) -> str:
     return business_now(conn).date().isoformat()
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None, check_same_thread=False)
+    # Resolve overrides at connection time so imports cannot pin the server to
+    # a stale machine-wide path before startup configuration is loaded.
+    conn = sqlite3.connect(database_path(), timeout=15, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -85,6 +88,27 @@ def write_db() -> Iterator[sqlite3.Connection]:
 
 def rowdict(row): return dict(row) if row is not None else None
 def rowsdict(rows): return [dict(r) for r in rows]
+
+
+def request_fingerprint(operation: str, payload: Any) -> str:
+    """Return a stable fingerprint for an idempotent write payload.
+
+    The request UUID itself is deliberately excluded so the same logical
+    operation can be compared across retries.
+    """
+    if isinstance(payload, dict):
+        body = dict(payload)
+        body.pop("client_request_id", None)
+    else:
+        body = payload
+    raw = json.dumps(
+        {"operation": str(operation), "payload": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -513,10 +537,6 @@ def _migration_6(conn) -> None:
         conn.execute("UPDATE settings SET value='',updated_at=? WHERE key='business_state_code'", (now,))
         conn.execute("UPDATE branches SET name='Main Showroom',gstin='',address='',phone='' WHERE id=?", (branch["id"],))
         conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
-        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
-        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
-        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
-        conn.execute("UPDATE counters SET active=CASE WHEN name='Counter 1' THEN 1 ELSE 0 END WHERE branch_id=?", (branch["id"],))
 
     now = utcnow()
     defaults = {
@@ -535,7 +555,79 @@ def _migration_6(conn) -> None:
             conn.execute("UPDATE settings SET value='1',updated_at=? WHERE key='company_setup_complete'", (now,))
 
 
-MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5), (6, _migration_6))
+def _migration_7(conn) -> None:
+    """Add write fingerprints, historical print snapshots, and persisted controls."""
+    for table in ("sales", "purchases", "sale_returns"):
+        _add_column_if_missing(conn, table, "request_fingerprint", "TEXT")
+        _add_column_if_missing(conn, table, "print_snapshot_json", "TEXT NOT NULL DEFAULT '{}'" )
+    _add_column_if_missing(conn, "purchases", "counter_id", "INTEGER REFERENCES counters(id)")
+    _add_column_if_missing(conn, "sale_return_items", "disposition", "TEXT NOT NULL DEFAULT 'in_stock'")
+    _add_column_if_missing(conn, "stock_audits", "snapshot_at", "TEXT")
+    _add_column_if_missing(conn, "stock_audits", "snapshot_movement_id", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS stock_audit_expected(
+            audit_id INTEGER NOT NULL REFERENCES stock_audits(id) ON DELETE CASCADE,
+            item_id INTEGER NOT NULL REFERENCES items(id),
+            version_at_start INTEGER NOT NULL,
+            status_at_start TEXT NOT NULL,
+            PRIMARY KEY(audit_id,item_id)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS day_closes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            branch_id INTEGER NOT NULL REFERENCES branches(id),
+            business_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'closed' CHECK(status IN ('closed','reopened')),
+            evidence_json TEXT NOT NULL,
+            evidence_hash TEXT NOT NULL,
+            closed_by INTEGER NOT NULL REFERENCES users(id),
+            closed_at TEXT NOT NULL,
+            reopened_by INTEGER REFERENCES users(id),
+            reopened_at TEXT,
+            reopen_reason TEXT,
+            UNIQUE(branch_id,business_date)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_type TEXT NOT NULL CHECK(transaction_type IN ('sale','sale_return','purchase')),
+            transaction_id INTEGER NOT NULL,
+            method TEXT NOT NULL CHECK(method IN ('cash','card','upi','credit','old_gold')),
+            direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+            amount_paise INTEGER NOT NULL CHECK(amount_paise >= 0),
+            reference TEXT,
+            account_code TEXT,
+            paid_at TEXT NOT NULL,
+            actor_id INTEGER REFERENCES users(id),
+            UNIQUE(transaction_type,transaction_id,method,reference)
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_transaction ON payments(transaction_type,transaction_id)")
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS payments_no_update BEFORE UPDATE ON payments
+           BEGIN SELECT RAISE(ABORT,'posted payments are immutable'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS payments_no_delete BEFORE DELETE ON payments
+           BEGIN SELECT RAISE(ABORT,'posted payments are immutable'); END"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_day_closes_branch_date ON day_closes(branch_id,business_date,status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_audit_expected_audit ON stock_audit_expected(audit_id)")
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS sales_snapshot_no_update BEFORE UPDATE OF
+           request_fingerprint,print_snapshot_json ON sales
+           BEGIN SELECT RAISE(ABORT,'sale request identity and print snapshot are immutable'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS sale_returns_snapshot_no_update BEFORE UPDATE OF
+           request_fingerprint,print_snapshot_json ON sale_returns
+           BEGIN SELECT RAISE(ABORT,'return request identity and print snapshot are immutable'); END"""
+    )
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5), (6, _migration_6), (7, _migration_7))
 
 def _migrate_schema(conn) -> None:
     applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}
@@ -580,6 +672,27 @@ def init_db(password_hasher)->None:
 
 def next_sequence(conn,name,prefix="",width=6):
     conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)",(name,));conn.execute("UPDATE sequences SET value=value+1 WHERE name=?",(name,));value=conn.execute("SELECT value FROM sequences WHERE name=?",(name,)).fetchone()[0];return f"{prefix}{value:0{width}d}"
+
+
+def valid_branch_counter(conn, branch_id: int, counter_id: int | None) -> bool:
+    branch = conn.execute("SELECT id,active FROM branches WHERE id=?", (int(branch_id),)).fetchone()
+    if not branch or not branch["active"]:
+        return False
+    if counter_id is None:
+        return True
+    counter = conn.execute(
+        "SELECT id,active FROM counters WHERE id=? AND branch_id=?",
+        (int(counter_id), int(branch_id)),
+    ).fetchone()
+    return bool(counter and counter["active"])
+
+
+def day_is_closed(conn, branch_id: int, business_day: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM day_closes WHERE branch_id=? AND business_date=? AND status='closed'",
+        (int(branch_id), str(business_day)),
+    ).fetchone()
+    return bool(row)
 
 def get_settings(conn): return {r["key"]:r["value"] for r in conn.execute("SELECT key,value FROM settings")}
 def set_setting(conn,key,value): conn.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(key,value,utcnow()))

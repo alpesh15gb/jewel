@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from typing import Any
 
 from reportlab.graphics.barcode import code128
@@ -48,10 +49,25 @@ def label_pdf(item: dict[str, Any], settings: dict[str, str]) -> bytes:
 
 
 def invoice_pdf(sale: dict[str, Any], lines: list[dict[str, Any]], customer: dict[str, Any] | None, settings: dict[str, str], old_gold: list[dict[str, Any]] | None = None) -> bytes:
+    snapshot = {}
+    try:
+        snapshot = json.loads(sale.get("print_snapshot_json") or "{}")
+    except (TypeError, ValueError):
+        snapshot = {}
+    effective_settings = dict(settings)
+    effective_settings.update(snapshot.get("seller") or {})
+    branch = snapshot.get("branch") or {}
+    if branch.get("address"):
+        effective_settings["business_address"] = branch["address"]
+    if branch.get("phone"):
+        effective_settings["business_phone"] = branch["phone"]
+    if branch.get("gstin"):
+        effective_settings["business_gstin"] = branch["gstin"]
+    customer = (snapshot.get("customer") or customer or {})
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12*mm, rightMargin=12*mm, topMargin=10*mm, bottomMargin=10*mm, title=sale["invoice_no"])
     styles = getSampleStyleSheet(); normal = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, leading=10); right = ParagraphStyle("right", parent=normal, alignment=TA_RIGHT); center = ParagraphStyle("center", parent=normal, alignment=TA_CENTER)
-    story = _business_heading(settings, styles)
+    story = _business_heading(effective_settings, styles)
     story.append(Spacer(1, 4*mm)); cust = customer or {}
     invoice_date = sale.get("business_date") or str(sale.get("created_at") or "")[:10]
     header = Table([[Paragraph(f"<b>Tax Invoice</b><br/>Invoice: {sale['invoice_no']}<br/>Date: {invoice_date}", normal), Paragraph(f"<b>Customer</b><br/>{cust.get('name','Walk-in Customer')}<br/>{cust.get('phone','')}<br/>{cust.get('gstin','')}", normal)]], colWidths=[90*mm, 90*mm])
@@ -69,10 +85,25 @@ def invoice_pdf(sale: dict[str, Any], lines: list[dict[str, Any]], customer: dic
 
 
 def credit_note_pdf(ret: dict[str, Any], items: list[dict[str, Any]], customer: dict[str, Any] | None, settings: dict[str, str]) -> bytes:
+    snapshot = {}
+    try:
+        snapshot = json.loads(ret.get("print_snapshot_json") or "{}")
+    except (TypeError, ValueError):
+        snapshot = {}
+    effective_settings = dict(settings)
+    effective_settings.update(snapshot.get("seller") or {})
+    branch = snapshot.get("branch") or {}
+    if branch.get("address"):
+        effective_settings["business_address"] = branch["address"]
+    if branch.get("phone"):
+        effective_settings["business_phone"] = branch["phone"]
+    if branch.get("gstin"):
+        effective_settings["business_gstin"] = branch["gstin"]
+    customer = snapshot.get("customer") or customer
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12*mm, rightMargin=12*mm, topMargin=10*mm, bottomMargin=10*mm, title=ret["return_no"])
     styles = getSampleStyleSheet(); normal = ParagraphStyle("cn-small", parent=styles["Normal"], fontSize=8, leading=10); right = ParagraphStyle("cn-right", parent=normal, alignment=TA_RIGHT); center = ParagraphStyle("cn-center", parent=normal, alignment=TA_CENTER)
-    story = _business_heading(settings, styles); story.append(Spacer(1,4*mm)); cust=customer or {}
+    story = _business_heading(effective_settings, styles); story.append(Spacer(1,4*mm)); cust=customer or {}
     header=Table([[Paragraph(f"<b>GST Credit Note</b><br/>Credit Note: {ret['return_no']}<br/>Date: {ret.get('business_date','')}<br/>Original Invoice: {ret.get('invoice_no','')}",normal),Paragraph(f"<b>Customer</b><br/>{cust.get('name',ret.get('customer_name') or 'Walk-in Customer')}<br/>{cust.get('phone','')}<br/>{cust.get('gstin','')}",normal)]],colWidths=[90*mm,90*mm])
     header.setStyle(TableStyle([('BOX',(0,0),(-1,-1),0.5,colors.grey),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)]));story += [header,Spacer(1,4*mm)]
     data=[["Tag","Taxable","GST","Round off","Credit"]]

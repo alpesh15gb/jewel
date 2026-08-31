@@ -18,9 +18,11 @@ MAGIC = b"JEWELLAN_DISCOVER_V1"
 
 
 class ApiError(RuntimeError):
-    def __init__(self, message: str, status: int = 0):
+    def __init__(self, message: str, status: int = 0, code: str = "", details: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.details = details or {}
 
 
 def normalize_fingerprint(value: str | None) -> str:
@@ -139,10 +141,16 @@ class Api:
                 r = self.session.request(method, url, headers=self.headers(), params=params, json=json_body, timeout=timeout, verify=verify)
                 if r.status_code >= 400:
                     try:
-                        detail = r.json().get("detail", r.text)
+                        payload = r.json()
+                        error = payload.get("error") if isinstance(payload, dict) else None
+                        detail = (error or {}).get("message") or payload.get("detail", r.text)
+                        code = str((error or {}).get("code") or "")
+                        details = {k:v for k,v in (error or {}).items() if k not in {"code","message","retryable","request_id"}}
                     except Exception:
                         detail = r.text
-                    raise ApiError(str(detail), r.status_code)
+                        code = ""
+                        details = {}
+                    raise ApiError(str(detail), r.status_code, code, details)
                 ctype = r.headers.get("content-type", "")
                 return r.content if "application/pdf" in ctype or "octet-stream" in ctype else r.json()
             except ApiError:
@@ -153,7 +161,7 @@ class Api:
                 last = exc
                 if attempt + 1 < tries:
                     time.sleep(.25)
-        raise ApiError(f"Cannot reach JewelLAN server: {last}")
+        raise ApiError(f"Cannot reach JewelLAN server: {last}", 0, "CONNECTIVITY_UNKNOWN", {"unknown_outcome": method.upper() != "GET"})
 
     def get(self, path, **kw):
         return self.request("GET", path, params=kw or None)

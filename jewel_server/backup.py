@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .db import DB_PATH, app_data_dir, connect, get_settings, read_db
+from .db import DB_PATH, app_data_dir, connect, database_path, get_settings, read_db
 
 
 def backup_dir() -> Path:
@@ -196,13 +196,14 @@ def restore_backup(path: str) -> dict[str, Any]:
     if not verified["ok"]:
         raise RuntimeError(f"Backup is not safe to restore: {verified}")
     pre_restore = create_backup("pre-restore")
+    target = database_path()
     try:
-        _copy_sqlite_database(source, DB_PATH)
-        restored = verify_backup(DB_PATH)
+        _copy_sqlite_database(source, target)
+        restored = verify_backup(target)
         if restored["integrity_check"].lower() != "ok" or restored["foreign_key_violations"]:
             raise RuntimeError(f"Restored database failed final verification: {restored}")
     except Exception:
-        _copy_sqlite_database(pre_restore, DB_PATH)
+        _copy_sqlite_database(pre_restore, target)
         raise
     _record_status(True, restored_from=source.name, pre_restore=pre_restore.name)
     return {"ok": True, "restored_from": source.name, "pre_restore": pre_restore.name, "sha256": verified["sha256"]}

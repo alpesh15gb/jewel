@@ -21,7 +21,12 @@ class DiscoveryResponder(threading.Thread):
 
     def run(self) -> None:
         insecure = os.environ.get("JEWELLAN_INSECURE_HTTP") == "1"
-        identity = {} if insecure else tls_identity()
+        try:
+            identity = {} if insecure else tls_identity()
+        except OSError:
+            # Discovery must never take down the server if certificate
+            # material is temporarily locked during startup or rotation.
+            return
         scheme = "http" if insecure else "https"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock = sock

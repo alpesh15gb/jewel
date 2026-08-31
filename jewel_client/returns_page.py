@@ -8,6 +8,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
+from .api import ApiError
+from .config import remove_pending_post, upsert_pending_post
 from .ui_theme import PALETTE, card, divider, status_pill
 
 
@@ -324,8 +326,9 @@ class ReturnsPage(ttk.Frame):
             parent=self,
         ):
             return
+        request_id = str(uuid.uuid4())
         payload = {
-            "client_request_id": str(uuid.uuid4()),
+            "client_request_id": request_id,
             "sale_item_ids": ids,
             "refund_cash": cash,
             "refund_card": card,
@@ -333,9 +336,33 @@ class ReturnsPage(ttk.Frame):
             "refund_credit": credit,
             "reason": reason,
         }
+        upsert_pending_post({
+            "request_id": request_id,
+            "operation": "sale_return",
+            "state": "submitting",
+            "created_at": uuid.uuid1().time,
+            "payload": {"sale_id": self.sale_id, **payload},
+        })
         try:
             result = self.api.post(f"/api/sales/{self.sale_id}/return", payload)
+            remove_pending_post(request_id)
+        except ApiError as exc:
+            if exc.status == 0 or exc.code == "CONNECTIVITY_UNKNOWN":
+                upsert_pending_post({
+                    "request_id": request_id,
+                    "operation": "sale_return",
+                    "state": "outcome_unknown",
+                    "created_at": uuid.uuid1().time,
+                    "payload": {"sale_id": self.sale_id, **payload},
+                    "error": str(exc),
+                })
+                messagebox.showwarning("Return outcome unknown", "The server may have posted this credit note. Do not retry with a new request ID. Open Pending Posts and reconcile this request.", parent=self)
+                return
+            remove_pending_post(request_id)
+            self._show_error(exc)
+            return
         except Exception as exc:
+            remove_pending_post(request_id)
             self._show_error(exc)
             return
         ret = result.get("return", result)
