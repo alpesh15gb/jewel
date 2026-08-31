@@ -358,7 +358,11 @@ class POSPage(Page):
         if not code:
             return
         try:
-            item = self.api.get(f"/api/items/barcode/{code}")
+            item = self.api.get(
+                f"/api/items/barcode/{code}",
+                branch_id=int(self.app.cfg.get("branch_id", 1)),
+                counter_id=self.app.cfg.get("counter_id") or None,
+            )
         except Exception as exc:
             self.app.error(exc)
             return
@@ -368,7 +372,7 @@ class POSPage(Page):
         if any(x["item_id"] == item["id"] for x in self.lines):
             self.app.error(f"{item['tag_no']} is already on this invoice")
             return
-        self.lines.append({"item_id": item["id"]})
+        self.lines.append({"item_id": item["id"], "item_version": item.get("version")})
         self.requote()
         self.scan_entry.focus_set()
 
@@ -585,7 +589,7 @@ class POSPage(Page):
             self.render()
             self.scan_entry.focus_set()
         except ApiError as exc:
-            if not posted and (exc.status == 0 or exc.code == "CONNECTIVITY_UNKNOWN"):
+            if not posted and (exc.status == 0 or exc.status >= 500 or exc.code == "CONNECTIVITY_UNKNOWN"):
                 upsert_pending_post({
                     "request_id": body.get("client_request_id", ""),
                     "operation": "sale",
