@@ -206,33 +206,40 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
     }
 
 
-def day_close(conn, business_date: str) -> dict[str, Any]:
+def day_close(conn, business_date: str, branch_id: int = 1) -> dict[str, Any]:
+    branch_id = int(branch_id)
     sale = conn.execute(
         "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(taxable_paise),0) taxable,coalesce(sum(gst_paise),0) gst,"
         "coalesce(sum(payment_cash_paise),0) cash,coalesce(sum(payment_card_paise),0) card,coalesce(sum(payment_upi_paise),0) upi,"
         "coalesce(sum(payment_credit_paise),0) credit,coalesce(sum(old_gold_value_paise),0) old_gold "
-        "FROM sales WHERE status='posted' AND business_date=?",
-        (business_date,),
+        "FROM sales WHERE status='posted' AND business_date=? AND branch_id=?",
+        (business_date, branch_id),
     ).fetchone()
-    cancelled = int(conn.execute("SELECT count(*) FROM sales WHERE status='cancelled' AND business_date=?", (business_date,)).fetchone()[0])
+    cancelled = int(conn.execute("SELECT count(*) FROM sales WHERE status='cancelled' AND business_date=? AND branch_id=?", (business_date,branch_id)).fetchone()[0])
     if _has_table(conn, "sale_returns"):
         ret = conn.execute(
             "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(taxable_paise),0) taxable,coalesce(sum(gst_paise),0) gst,"
             "coalesce(sum(refund_cash_paise),0) cash,coalesce(sum(refund_card_paise),0) card,coalesce(sum(refund_upi_paise),0) upi,coalesce(sum(refund_credit_paise),0) credit "
-            "FROM sale_returns WHERE status='posted' AND business_date=?",
-            (business_date,),
+            "FROM sale_returns WHERE status='posted' AND business_date=? AND branch_id=?",
+            (business_date, branch_id),
         ).fetchone()
-        cancelled_returns = int(conn.execute("SELECT count(*) FROM sale_returns WHERE status='cancelled' AND business_date=?", (business_date,)).fetchone()[0])
+        cancelled_returns = int(conn.execute("SELECT count(*) FROM sale_returns WHERE status='cancelled' AND business_date=? AND branch_id=?", (business_date,branch_id)).fetchone()[0])
     else:
         ret = {"c":0,"total":0,"taxable":0,"gst":0,"cash":0,"card":0,"upi":0,"credit":0}
         cancelled_returns = 0
     purchase = conn.execute(
-        "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(paid_paise),0) paid FROM purchases WHERE business_date=?",
-        (business_date,),
+        "SELECT count(*) c,coalesce(sum(total_paise),0) total,coalesce(sum(paid_paise),0) paid FROM purchases WHERE business_date=? AND branch_id=?",
+        (business_date, branch_id),
     ).fetchone()
     journal = conn.execute(
-        "SELECT coalesce(sum(l.debit_paise),0) debit,coalesce(sum(l.credit_paise),0) credit FROM journal_entries e JOIN journal_lines l ON l.entry_id=e.id WHERE e.entry_date=?",
-        (business_date,),
+        """SELECT coalesce(sum(l.debit_paise),0) debit,coalesce(sum(l.credit_paise),0) credit
+           FROM journal_entries e JOIN journal_lines l ON l.entry_id=e.id
+           WHERE e.entry_date=? AND (
+             (e.ref_type IN ('sale','sale_cancel') AND EXISTS (SELECT 1 FROM sales s WHERE s.id=e.ref_id AND s.branch_id=?)) OR
+             (e.ref_type IN ('sale_return','sale_return_cancel') AND EXISTS (SELECT 1 FROM sale_returns r WHERE r.id=e.ref_id AND r.branch_id=?)) OR
+             (e.ref_type='purchase' AND EXISTS (SELECT 1 FROM purchases p WHERE p.id=e.ref_id AND p.branch_id=?))
+           )""",
+        (business_date, branch_id, branch_id, branch_id),
     ).fetchone()
 
     sale_payment = int(sale["cash"])+int(sale["card"])+int(sale["upi"])+int(sale["credit"])+int(sale["old_gold"])
@@ -241,6 +248,7 @@ def day_close(conn, business_date: str) -> dict[str, Any]:
     net_payment = sale_payment-refund_payment
     return {
         "date": business_date,
+        "branch_id": branch_id,
         "sales": {
             "count": int(sale["c"]), "total": paise_to_money(sale["total"]), "taxable": paise_to_money(sale["taxable"]), "gst": paise_to_money(sale["gst"]),
             "cash": paise_to_money(sale["cash"]), "card": paise_to_money(sale["card"]), "upi": paise_to_money(sale["upi"]), "credit": paise_to_money(sale["credit"]), "old_gold": paise_to_money(sale["old_gold"]),
