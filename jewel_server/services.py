@@ -87,10 +87,12 @@ def quote_sale(conn,lines,header_discount=0,old_gold_value=0,context=None,truste
         item_d=dict(item)
         if item_d['status']!='in_stock':raise HTTPException(409,f"Tag {item_d['tag_no']} is {item_d['status']}")
         if branch_id is not None and int(item_d.get('branch_id') or 0)!=branch_id:
-            raise HTTPException(409,detail={'code':'CROSS_BRANCH_ITEM','message':f"Tag {item_d['tag_no']} belongs to another branch",'item_id':iid,'item_branch_id':item_d.get('branch_id'),'sale_branch_id':branch_id})
+            raise HTTPException(409,detail={'code':'ITEM_LOCATION_CONFLICT','message':f"Tag {item_d['tag_no']} belongs to another branch",'item_id':iid,'item_branch_id':item_d.get('branch_id'),'sale_branch_id':branch_id})
         if counter_id is not None and item_d.get('counter_id') not in (None,counter_id):
             raise HTTPException(409,detail={'code':'CROSS_COUNTER_ITEM','message':f"Tag {item_d['tag_no']} is assigned to another counter",'item_id':iid,'item_counter_id':item_d.get('counter_id'),'sale_counter_id':counter_id})
         supplied_version=ln.get('item_version')
+        if not trusted_overrides and supplied_version in (None,''):
+            raise HTTPException(400,detail={'code':'ITEM_VERSION_REQUIRED','message':f"Tag {item_d['tag_no']} must be refreshed before quoting",'item_id':iid,'current_version':item_d.get('version')})
         if supplied_version not in (None,'') and int(supplied_version)!=int(item_d.get('version') or 0):
             raise HTTPException(409,detail={'code':'VERSION_CONFLICT','message':f"Tag {item_d['tag_no']} changed after it was loaded",'item_id':iid,'current_version':item_d.get('version')})
         if trusted_overrides:

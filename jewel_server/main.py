@@ -614,7 +614,7 @@ def day_close_post(p:dict=Body(default={}),u=Depends(require('reports'))):
         if not c.execute('SELECT 1 FROM branches WHERE id=? AND active=1',(branch_id,)).fetchone():raise HTTPException(400,'Branch is not active')
         existing=c.execute("SELECT * FROM day_closes WHERE branch_id=? AND business_date=?",(branch_id,report_date)).fetchone()
         if existing and existing['status']=='closed':return {'ok':True,'already_closed':True,'record':dict(existing)}
-        report=day_close(c,report_date,branch_id);integrity=database_integrity(c)
+        report=day_close(c,report_date,branch_id);integrity=database_integrity(c,branch_id=branch_id)
         checks_ok=bool(integrity.get('ok')) and bool(report.get('journal',{}).get('balanced')) and bool(report.get('sales',{}).get('payments_match_sales')) and bool(report.get('returns',{}).get('refunds_match_returns'))
         if not checks_ok:
             raise HTTPException(409,detail={'code':'DAY_CLOSE_BLOCKED','message':'Day close is blocked by reconciliation or data-health failures','report':report,'integrity':integrity})

@@ -28,7 +28,35 @@ def _has_table(conn, table: str) -> bool:
     return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
 
 
-def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
+def _issue_belongs_to_branch(conn, issue: dict[str, Any], branch_id: int) -> bool:
+    """Keep branch-level day-close evidence scoped to the selected branch."""
+    kind = issue.get("kind")
+    if kind in {"sqlite", "foreign_key", "audit_chain"}:
+        return True
+    queries = (
+        ("item_id", "SELECT branch_id FROM items WHERE id=?"),
+        ("sale_id", "SELECT branch_id FROM sales WHERE id=?"),
+        ("return_id", "SELECT branch_id FROM sale_returns WHERE id=?"),
+    )
+    for key, sql in queries:
+        if key in issue:
+            row = conn.execute(sql, (issue[key],)).fetchone()
+            return bool(row and int(row[0]) == int(branch_id))
+    if "entry_id" in issue:
+        row = conn.execute(
+            "SELECT ref_type,ref_id FROM journal_entries WHERE id=?", (issue["entry_id"],)
+        ).fetchone()
+        if not row:
+            return False
+        table = {"sale": "sales", "sale_cancel": "sales", "purchase": "purchases", "sale_return": "sale_returns", "sale_return_cancel": "sale_returns"}.get(row["ref_type"])
+        if not table:
+            return True
+        branch = conn.execute(f"SELECT branch_id FROM {table} WHERE id=?", (row["ref_id"],)).fetchone()
+        return bool(branch and int(branch[0]) == int(branch_id))
+    return True
+
+
+def database_integrity(conn, max_details: int = 100, branch_id: int | None = None) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
 
     quick_rows = conn.execute("PRAGMA quick_check").fetchall()
@@ -173,6 +201,7 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
         ).fetchall()
     for row in orphan_sold:
         _append(issues, "stock_state", f"Sold tag {row['tag_no']} has no active posted invoice ownership", item_id=row["id"])
+    orphan_sold_count = len(orphan_sold)
 
     audit = verify_audit_chain(conn)
     if not audit["ok"]:
@@ -184,18 +213,33 @@ def database_integrity(conn, max_details: int = 100) -> dict[str, Any]:
         for row in canonical["errors"][:20]:
             _append(issues, "canonical", f"Exact paise/milligram mirror mismatch in {row['table']}", **row)
 
+    if branch_id is not None:
+        issues = [issue for issue in issues if _issue_belongs_to_branch(conn, issue, int(branch_id))]
+        weight_violations = sum(issue.get("kind") == "weight" for issue in issues)
+        invalid_huid = sum(issue.get("kind") == "huid" for issue in issues)
+        duplicate_huid = sum(issue.get("kind") == "huid_duplicate" for issue in issues)
+        unbalanced = [issue for issue in issues if issue.get("kind") == "journal"]
+        sale_total_errors = sum(issue.get("kind") == "sale_total" for issue in issues)
+        payment_errors = sum(issue.get("kind") == "payment" for issue in issues)
+        missing_journal = sum(issue.get("kind") == "journal_missing" for issue in issues)
+        stock_state_errors = sum(issue.get("kind") == "stock_state" for issue in issues)
+        orphan_sold_count = 0
+        return_total_errors = sum(issue.get("kind") in {"return_total", "return_tax"} for issue in issues)
+        return_payment_errors = sum(issue.get("kind") == "return_payment" for issue in issues)
+        return_state_errors = sum(issue.get("kind") == "return_state" for issue in issues)
+
     return {
         "ok": quick_ok and not fk_rows and not issues,
         "sqlite_quick_check": quick_messages,
         "foreign_key_violations": len(fk_rows),
-        "weight_violations": len(weight_rows),
-        "invalid_huid": len(invalid_huid),
-        "duplicate_huid_groups": len(duplicate_huid),
+            "weight_violations": weight_violations if branch_id is not None else len(weight_rows),
+            "invalid_huid": invalid_huid if branch_id is not None else len(invalid_huid),
+            "duplicate_huid_groups": duplicate_huid if branch_id is not None else len(duplicate_huid),
         "unbalanced_journals": len(unbalanced),
         "sale_total_mismatches": sale_total_errors,
         "payment_mismatches": payment_errors,
         "missing_journals": missing_journal + return_journal_errors,
-        "stock_state_mismatches": stock_state_errors + len(orphan_sold),
+        "stock_state_mismatches": stock_state_errors + orphan_sold_count,
         "return_total_mismatches": return_total_errors,
         "return_payment_mismatches": return_payment_errors,
         "return_state_mismatches": return_state_errors,

@@ -520,13 +520,13 @@ class POSPage(Page):
     def add_scan(self,event=None):
         code=self.scan.get().strip(); self.scan.set("")
         if not code:return
-        try:i=self.api.get(f"/api/items/barcode/{code}")
+        try:i=self.api.get(f"/api/items/barcode/{code}",branch_id=int(self.app.cfg.get("branch_id",1)),counter_id=self.app.cfg.get("counter_id") or None)
         except Exception as e:self.app.error(e);return
         if i["status"]!="in_stock":self.app.error(f"{i['tag_no']} is {i['status']}");return
         if any(x["item_id"]==i["id"] for x in self.lines): self.app.error(f"{i['tag_no']} is already on this invoice"); return
-        self.lines.append({"item_id":i["id"]}); self.requote(); self.scan_entry.focus_set()
+        self.lines.append({"item_id":i["id"],"item_version":i.get("version")}); self.requote(); self.scan_entry.focus_set()
     def requote(self):
-        try:self.quote=self.api.post("/api/sales/quote",{"lines":self.lines,"discount":float(self.discount.get() or 0),"old_gold":self.old});self.render()
+        try:self.quote=self.api.post("/api/sales/quote",{"lines":self.lines,"discount":float(self.discount.get() or 0),"old_gold":self.old,"branch_id":int(self.app.cfg.get("branch_id",1)),"counter_id":self.app.cfg.get("counter_id") or None});self.render()
         except Exception as e:
             if self.lines:self.app.error(e)
     def render(self):
@@ -549,7 +549,7 @@ class POSPage(Page):
         if not self.lines:return
         try:
             idx=self.customer.current(); cid=self.customers[idx-1]["id"] if idx>0 else None; p={k:float(v.get() or 0) for k,v in self.pay.items()}
-            body={"client_request_id":str(uuid.uuid4()),"branch_id":int(self.app.cfg.get("branch_id",1)),"counter_id":self.app.cfg.get("counter_id") or None,"customer_id":cid,"lines":self.lines,"discount":float(self.discount.get() or 0),"old_gold":self.old,"payment_cash":p["cash"],"payment_card":p["card"],"payment_upi":p["upi"],"payment_credit":p["credit"]}
+            body={"client_request_id":str(uuid.uuid4()),"branch_id":int(self.app.cfg.get("branch_id",1)),"counter_id":self.app.cfg.get("counter_id") or None,"customer_id":cid,"lines":self.lines,"discount":float(self.discount.get() or 0),"old_gold":self.old,"payment_cash":p["cash"],"payment_card":p["card"],"payment_upi":p["upi"],"payment_credit":p["credit"],"quote_id":self.quote.get("quote_id"),"quote_hash":self.quote.get("quote_hash")}
             r=self.api.post("/api/sales",body); open_pdf(self.api.request("GET",f"/api/sales/{r['id']}/invoice.pdf"),f"{r['invoice_no']}.pdf")
             messagebox.showinfo("Sale completed",f"{r['invoice_no']}\n{money(r['total'])}",parent=self); self.lines=[]; self.old=[]; self.quote={}; self.discount.set("0"); [v.set("0") for v in self.pay.values()]; self.render(); self.scan_entry.focus_set()
         except Exception as e:self.app.error(e)
@@ -588,7 +588,7 @@ class PurchasesPage(Page):
         if not d:return
         try:
             for k in ("gross_weight","stone_weight","net_weight","stone_value","cost_amount","making_value","wastage_percent"):d[k]=float(d.get(k) or 0)
-            paid=simpledialog.askfloat("Purchase","Paid now",initialvalue=d["cost_amount"],parent=self) or 0;r=self.api.post("/api/purchases",{"client_request_id":str(uuid.uuid4()),"supplier_id":sid,"branch_id":int(self.app.cfg.get("branch_id",1)),"paid":paid,"gst":0,"items":[d]});messagebox.showinfo("Purchase",r["purchase_no"],parent=self);self.refresh()
+            paid=simpledialog.askfloat("Purchase","Paid now",initialvalue=d["cost_amount"],parent=self) or 0;r=self.api.post("/api/purchases",{"client_request_id":str(uuid.uuid4()),"supplier_id":sid,"branch_id":int(self.app.cfg.get("branch_id",1)),"counter_id":self.app.cfg.get("counter_id") or None,"paid":paid,"gst":0,"items":[d]});messagebox.showinfo("Purchase",r["purchase_no"],parent=self);self.refresh()
         except Exception as e:self.app.error(e)
 
 

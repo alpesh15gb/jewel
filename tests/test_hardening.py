@@ -189,7 +189,9 @@ def test_canonical_paise_and_milligram_storage_is_populated_and_guarded():
                 conn.execute("UPDATE items SET cost_amount=cost_amount+1 WHERE id=?", (item["id"],))
 
         quote = client.post(
-            "/api/sales/quote", headers=headers, json={"lines": [{"item_id": item["id"]}], "old_gold": []}
+            "/api/sales/quote",
+            headers=headers,
+            json={"lines": [{"item_id": item["id"], "item_version": item["version"]}], "old_gold": [], "branch_id": 1, "counter_id": 1},
         )
         assert quote.status_code == 200, quote.text
         sale = client.post(
@@ -199,12 +201,14 @@ def test_canonical_paise_and_milligram_storage_is_populated_and_guarded():
                 "client_request_id": str(uuid.uuid4()),
                 "branch_id": 1,
                 "counter_id": 1,
-                "lines": [{"item_id": item["id"]}],
+                "lines": [{"item_id": item["id"], "item_version": item["version"]}],
                 "old_gold": [],
                 "payment_cash": quote.json()["total"],
                 "payment_card": 0,
                 "payment_upi": 0,
                 "payment_credit": 0,
+                "quote_id": quote.json()["quote_id"],
+                "quote_hash": quote.json()["quote_hash"],
             },
         )
         assert sale.status_code == 200, sale.text
@@ -297,7 +301,9 @@ def test_posted_sale_lines_and_journals_are_immutable():
         add_rate(client, headers)
         item = client.post("/api/items", headers=headers, json=make_item_payload()).json()
         quote = client.post(
-            "/api/sales/quote", headers=headers, json={"lines": [{"item_id": item["id"]}], "old_gold": []}
+            "/api/sales/quote",
+            headers=headers,
+            json={"lines": [{"item_id": item["id"], "item_version": item["version"]}], "old_gold": [], "branch_id": 1, "counter_id": 1},
         ).json()
         sale = client.post(
             "/api/sales",
@@ -306,12 +312,14 @@ def test_posted_sale_lines_and_journals_are_immutable():
                 "client_request_id": str(uuid.uuid4()),
                 "branch_id": 1,
                 "counter_id": 1,
-                "lines": [{"item_id": item["id"]}],
+                "lines": [{"item_id": item["id"], "item_version": item["version"]}],
                 "old_gold": [],
                 "payment_cash": quote["total"],
                 "payment_card": 0,
                 "payment_upi": 0,
                 "payment_credit": 0,
+                "quote_id": quote["quote_id"],
+                "quote_hash": quote["quote_hash"],
             },
         )
         assert sale.status_code == 200, sale.text
@@ -341,7 +349,9 @@ def test_two_counter_sale_attempts_cannot_sell_same_tag_twice():
         add_rate(client, headers)
         item = client.post("/api/items", headers=headers, json=make_item_payload()).json()
         quote = client.post(
-            "/api/sales/quote", headers=headers, json={"lines": [{"item_id": item["id"]}], "old_gold": []}
+            "/api/sales/quote",
+            headers=headers,
+            json={"lines": [{"item_id": item["id"], "item_version": item["version"]}], "old_gold": [], "branch_id": 1, "counter_id": 1},
         ).json()
 
     barrier = threading.Barrier(2)
@@ -353,12 +363,14 @@ def test_two_counter_sale_attempts_cannot_sell_same_tag_twice():
             "client_request_id": str(uuid.uuid4()),
             "branch_id": 1,
             "counter_id": 1,
-            "lines": [{"item_id": item["id"]}],
+            "lines": [{"item_id": item["id"], "item_version": item["version"]}],
             "old_gold": [],
             "payment_cash": quote["total"],
             "payment_card": 0,
             "payment_upi": 0,
             "payment_credit": 0,
+            "quote_id": quote["quote_id"],
+            "quote_hash": quote["quote_hash"],
             "notes": counter_name,
         }
         barrier.wait()

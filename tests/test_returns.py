@@ -50,10 +50,10 @@ def _make_sale(client: TestClient, headers: dict[str,str], customer_id: int | No
     for n in range(count):
         r=client.post("/api/items",headers=headers,json=_item(f"Return Test Ring {uuid.uuid4().hex[:5]}-{n}"))
         assert r.status_code==200,r.text;items.append(r.json())
-    lines=[{"item_id":x["id"]} for x in items]
-    q=client.post("/api/sales/quote",headers=headers,json={"lines":lines,"discount":0,"old_gold":[]})
+    lines=[{"item_id":x["id"],"item_version":x["version"]} for x in items]
+    q=client.post("/api/sales/quote",headers=headers,json={"lines":lines,"discount":0,"old_gold":[],"branch_id":1,"counter_id":1})
     assert q.status_code==200,q.text
-    payload={"client_request_id":str(uuid.uuid4()),"branch_id":1,"counter_id":1,"customer_id":customer_id,"lines":lines,"discount":0,"old_gold":[],"payment_cash":q.json()["total"],"payment_card":0,"payment_upi":0,"payment_credit":0}
+    payload={"client_request_id":str(uuid.uuid4()),"branch_id":1,"counter_id":1,"customer_id":customer_id,"lines":lines,"discount":0,"old_gold":[],"payment_cash":q.json()["total"],"payment_card":0,"payment_upi":0,"payment_credit":0,"quote_id":q.json()["quote_id"],"quote_hash":q.json()["quote_hash"]}
     sale=client.post("/api/sales",headers=headers,json=payload)
     assert sale.status_code==200,sale.text
     detail=client.get(f"/api/sales/{sale.json()['id']}",headers=headers)
@@ -129,8 +129,9 @@ def test_customer_credit_sale_uses_exact_balance_and_cancel_reverses_it():
         assert cust.status_code==200;cid=cust.json()["id"]
         client.post("/api/rates",headers=headers,json={"metal":"Gold","purity":"916","rate_per_gram":"7000"})
         made=client.post("/api/items",headers=headers,json=_item(f"Credit Ring {uuid.uuid4().hex[:5]}"));assert made.status_code==200,made.text
-        q=client.post("/api/sales/quote",headers=headers,json={"lines":[{"item_id":made.json()["id"]}],"old_gold":[]});assert q.status_code==200
-        sale=client.post("/api/sales",headers=headers,json={"client_request_id":str(uuid.uuid4()),"branch_id":1,"counter_id":1,"customer_id":cid,"lines":[{"item_id":made.json()["id"]}],"old_gold":[],"payment_cash":0,"payment_card":0,"payment_upi":0,"payment_credit":q.json()["total"]});assert sale.status_code==200,sale.text
+        line={"item_id":made.json()["id"],"item_version":made.json()["version"]}
+        q=client.post("/api/sales/quote",headers=headers,json={"lines":[line],"old_gold":[],"branch_id":1,"counter_id":1});assert q.status_code==200
+        sale=client.post("/api/sales",headers=headers,json={"client_request_id":str(uuid.uuid4()),"branch_id":1,"counter_id":1,"customer_id":cid,"lines":[line],"old_gold":[],"payment_cash":0,"payment_card":0,"payment_upi":0,"payment_credit":q.json()["total"],"quote_id":q.json()["quote_id"],"quote_hash":q.json()["quote_hash"]});assert sale.status_code==200,sale.text
         with read_db() as conn:
             row=conn.execute("SELECT balance,balance_paise FROM customers WHERE id=?",(cid,)).fetchone();assert row["balance_paise"]==money_paise(q.json()["total"]);assert money_paise(row["balance"])==row["balance_paise"]
         cancel=client.post(f"/api/sales/{sale.json()['id']}/cancel",headers=headers,json={"reason":"Credit sale test reversal"});assert cancel.status_code==200,cancel.text
