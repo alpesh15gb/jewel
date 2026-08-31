@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from .db import audit, business_date, business_now, day_is_closed, next_sequence, request_fingerprint, utcnow
 from .precision import money, money_paise
-from .services import _journal, _record_payments
+from .services import _journal, _record_payments, require_client_request_id
 from .tally import enqueue_tally
 
 
@@ -116,14 +116,13 @@ def quote_sale_return(conn, sale_id: int, sale_item_ids: list[int] | None = None
 
 
 def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str, Any], client_ip: str | None = None) -> dict[str, Any]:
-    req = str(payload.get("client_request_id") or "").strip() or None
+    req = require_client_request_id(payload, "sale return")
     fingerprint = request_fingerprint("sale_return", payload)
-    if req:
-        old = conn.execute("SELECT id,request_fingerprint FROM sale_returns WHERE client_request_id=?", (req,)).fetchone()
-        if old:
-            if old["request_fingerprint"] and old["request_fingerprint"] != fingerprint:
-                raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different return data","request_id":req})
-            return _return_payload(conn, int(old["id"])) | {"idempotent": True}
+    old = conn.execute("SELECT id,request_fingerprint FROM sale_returns WHERE client_request_id=?", (req,)).fetchone()
+    if old:
+        if old["request_fingerprint"] and old["request_fingerprint"] != fingerprint:
+            raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different return data","request_id":req})
+        return _return_payload(conn, int(old["id"])) | {"idempotent": True}
 
     reason = str(payload.get("reason") or "").strip()
     if len(reason) < 3:
@@ -134,8 +133,9 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
     sale = dict(sale_row)
     if sale["status"] != "posted":
         raise HTTPException(409, "Cancelled invoices cannot be returned")
-    if day_is_closed(conn, int(sale["branch_id"]), str(sale.get("business_date") or business_date(conn))):
-        raise HTTPException(409, detail={"code":"DAY_CLOSED","message":"Returns cannot be posted after day close"})
+    return_business_day = business_date(conn)
+    if day_is_closed(conn, int(sale["branch_id"]), return_business_day):
+        raise HTTPException(409, detail={"code":"DAY_CLOSED","message":"Returns cannot be posted on a closed business date"})
 
     requested = payload.get("sale_item_ids") or []
     try:
@@ -213,7 +213,7 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
              reason,status,user_id,created_at
            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posted',?,?)""",
         (
-            ret_no,req,fingerprint,sale.get("print_snapshot_json") or "{}",sale_id,sale.get("customer_id"),sale["branch_id"],business_date(conn),
+            ret_no,req,fingerprint,sale.get("print_snapshot_json") or "{}",sale_id,sale.get("customer_id"),sale["branch_id"],return_business_day,
             taxable_paise,gst_paise,cgst_paise,sgst_paise,igst_paise,round_off_paise,total_paise,
             refund_cash,refund_card,refund_upi,refund_credit,reason,user["id"],now,
         ),
