@@ -347,7 +347,7 @@ class ReturnsPage(ttk.Frame):
             result = self.api.post(f"/api/sales/{self.sale_id}/return", payload)
             remove_pending_post(request_id)
         except ApiError as exc:
-            if exc.status == 0 or exc.code == "CONNECTIVITY_UNKNOWN":
+            if exc.status == 0 or exc.status >= 500 or exc.code == "CONNECTIVITY_UNKNOWN":
                 upsert_pending_post({
                     "request_id": request_id,
                     "operation": "sale_return",
