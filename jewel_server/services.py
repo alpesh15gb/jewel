@@ -1,5 +1,5 @@
 from __future__ import annotations
-import datetime as dt, hashlib, json, re, sqlite3
+import datetime as dt, hashlib, json, re, sqlite3, uuid
 from typing import Any
 from fastapi import HTTPException
 from .db import audit,business_date,business_now,day_is_closed,get_settings,next_sequence,request_fingerprint,utcnow,valid_branch_counter
@@ -7,6 +7,18 @@ from .tally import enqueue_tally
 from .precision import decimal_value,money,money_decimal,money_equal,money_paise,money_sum,nearest_rupee,paise_money,weight,weight_decimal,weight_equal,weight_mg
 
 PRODUCTION_HARDENED_V1 = True
+
+def require_client_request_id(payload: dict[str, Any], operation: str = "operation") -> str:
+    raw = str(payload.get("client_request_id") or "").strip()
+    if not raw:
+        raise HTTPException(400, detail={"code":"REQUEST_ID_REQUIRED","message":f"client_request_id is required for {operation}"})
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(400, detail={"code":"INVALID_REQUEST_ID","message":"client_request_id must be a valid UUID"})
+    return str(parsed)
+
+
 def purity_fraction(purity:str)->float:
     p=str(purity).upper().strip().replace('K','');known={'999':.999,'995':.995,'990':.990,'958':.958,'950':.950,'925':.925,'916':.916,'875':.875,'833':.833,'750':.750,'585':.585,'417':.417,'375':.375,'24':.999,'23':.958,'22':.916,'21':.875,'20':.833,'18':.750,'14':.585,'10':.417,'9':.375}
     if p in known:return known[p]
@@ -61,15 +73,36 @@ def calculate_item_price(conn,item,overrides=None):
     return {'item_id':i['id'],'item_version':i.get('version'),'tag_no':i['tag_no'],'description':i['name'],'metal':i['metal'],'purity':i['purity'],'gross_weight':weight(i['gross_weight']),'net_weight':weight(net_d),'metal_rate':money(rate_d),'metal_value':money(metal_d),'wastage_percent':float(wp_d),'wastage_value':money(wastage_d),'making_type':making_type,'making_value':float(making_value_d),'making_charge':money(making_d),'stone_value':money(stone_d),'discount':money(discount_d),'taxable':money(taxable_d),'gst_rate':float(gst_rate_d),'gst_amount':money(gst_d),'line_total':money(taxable_d+gst_d),'cost_amount':money(i.get('cost_amount',0))}
 
 
-def quote_sale(conn,lines,header_discount=0,old_gold_value=0,context=None):
-    out=[];seen=set()
+def quote_sale(conn,lines,header_discount=0,old_gold_value=0,context=None,trusted_overrides=False):
+    out=[];seen=set();ctx=context or {}
+    branch_id=ctx.get('branch_id');branch_id=int(branch_id) if branch_id not in (None,'') else None
+    counter_id=ctx.get('counter_id');counter_id=int(counter_id) if counter_id not in (None,'') else None
+    allowed_client_fields={'item_id','item_version'}
     for ln in lines:
+        if not isinstance(ln,dict):raise HTTPException(400,'Each invoice line must be an object')
         iid=int(ln.get('item_id') or 0)
         if iid in seen:raise HTTPException(400,'Same tag scanned twice')
         seen.add(iid);item=conn.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
         if not item:raise HTTPException(404,f'Item {iid} not found')
-        if item['status']!='in_stock':raise HTTPException(409,f"Tag {item['tag_no']} is {item['status']}")
-        out.append(calculate_item_price(conn,item,ln))
+        item_d=dict(item)
+        if item_d['status']!='in_stock':raise HTTPException(409,f"Tag {item_d['tag_no']} is {item_d['status']}")
+        if branch_id is not None and int(item_d.get('branch_id') or 0)!=branch_id:
+            raise HTTPException(409,detail={'code':'ITEM_LOCATION_CONFLICT','message':f"Tag {item_d['tag_no']} belongs to another branch",'item_id':iid,'item_branch_id':item_d.get('branch_id'),'sale_branch_id':branch_id})
+        if counter_id is not None and item_d.get('counter_id') not in (None,counter_id):
+            raise HTTPException(409,detail={'code':'CROSS_COUNTER_ITEM','message':f"Tag {item_d['tag_no']} is assigned to another counter",'item_id':iid,'item_counter_id':item_d.get('counter_id'),'sale_counter_id':counter_id})
+        supplied_version=ln.get('item_version')
+        if not trusted_overrides and supplied_version in (None,''):
+            raise HTTPException(400,detail={'code':'ITEM_VERSION_REQUIRED','message':f"Tag {item_d['tag_no']} must be refreshed before quoting",'item_id':iid,'current_version':item_d.get('version')})
+        if supplied_version not in (None,'') and int(supplied_version)!=int(item_d.get('version') or 0):
+            raise HTTPException(409,detail={'code':'VERSION_CONFLICT','message':f"Tag {item_d['tag_no']} changed after it was loaded",'item_id':iid,'current_version':item_d.get('version')})
+        if trusted_overrides:
+            pricing_overrides=ln
+        else:
+            unexpected=sorted(set(ln)-allowed_client_fields)
+            if unexpected:
+                raise HTTPException(400,detail={'code':'PRICE_OVERRIDE_NOT_ALLOWED','message':'Sale-line pricing is server controlled; submit item_id/item_version only','fields':unexpected})
+            pricing_overrides={}
+        out.append(calculate_item_price(conn,item,pricing_overrides))
     subtotal_d=sum((money_decimal(x['taxable']) for x in out),decimal_value(0))
     requested_discount=money_decimal(max(decimal_value(0),decimal_value(header_discount)))
     header_d=min(requested_discount,subtotal_d);remaining=header_d
@@ -84,7 +117,7 @@ def quote_sale(conn,lines,header_discount=0,old_gold_value=0,context=None):
         gst_d=money_decimal(line_taxable*decimal_value(line['gst_rate'])/decimal_value(100));line['gst_amount']=money(gst_d);line['line_total']=money(line_taxable+gst_d)
     taxable_d=sum((money_decimal(x['taxable']) for x in out),decimal_value(0));gst_d=sum((money_decimal(x['gst_amount']) for x in out),decimal_value(0));gross_d=money_decimal(taxable_d+gst_d)
     rounded=nearest_rupee(gross_d);round_off=money(money_decimal(rounded)-gross_d);total=money(gross_d+money_decimal(round_off));old_value=money(old_gold_value);payable=money(max(decimal_value(0),money_decimal(total)-money_decimal(old_value)))
-    quote_body={'lines':out,'discount':money(header_d),'old_gold_value':old_value,'context':context or {}}
+    quote_body={'lines':out,'discount':money(header_d),'old_gold_value':old_value,'context':ctx}
     quote_hash=hashlib.sha256(json.dumps(quote_body,ensure_ascii=False,sort_keys=True,separators=(',',':'),default=str).encode('utf-8')).hexdigest()
     return {'lines':out,'subtotal':money(subtotal_d),'discount':money(header_d),'taxable':money(taxable_d),'gst':money(gst_d),'round_off':round_off,'total':total,'old_gold_value':old_value,'payable':payable,'quote_id':'Q-'+quote_hash[:20],'quote_version':quote_hash[:16],'quote_hash':quote_hash}
 
@@ -125,14 +158,13 @@ def _record_payments(conn, transaction_type: str, transaction_id: int, rows: lis
 
 
 def post_sale(conn,payload,user,client_ip=None):
-    req=str(payload.get('client_request_id') or '').strip() or None
+    req=require_client_request_id(payload,'sale')
     fingerprint=request_fingerprint("sale",payload)
-    if req:
-        e=conn.execute('SELECT id,invoice_no,total,request_fingerprint FROM sales WHERE client_request_id=?',(req,)).fetchone()
-        if e:
-            if e['request_fingerprint'] and e['request_fingerprint'] != fingerprint:
-                raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different sale data","request_id":req})
-            return {'id':e['id'],'invoice_no':e['invoice_no'],'total':e['total'],'idempotent':True}
+    e=conn.execute('SELECT id,invoice_no,total,request_fingerprint FROM sales WHERE client_request_id=?',(req,)).fetchone()
+    if e:
+        if e['request_fingerprint'] and e['request_fingerprint'] != fingerprint:
+            raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different sale data","request_id":req})
+        return {'id':e['id'],'invoice_no':e['invoice_no'],'total':e['total'],'idempotent':True}
     olds=payload.get('old_gold') or [];old_value=money_sum(x.get('value',0) for x in olds)
     bid=int(payload.get('branch_id') or 1);counter=payload.get('counter_id') or None;counter=int(counter) if counter is not None else None
     if not valid_branch_counter(conn,bid,counter):
@@ -143,7 +175,9 @@ def post_sale(conn,payload,user,client_ip=None):
     context={"branch_id":bid,"counter_id":counter}
     q=quote_sale(conn,payload.get('lines') or [],payload.get('discount',0),old_value,context)
     supplied_quote=payload.get('quote_hash') or payload.get('quote_id')
-    if supplied_quote and supplied_quote not in (q['quote_hash'],q['quote_id']):
+    if not supplied_quote:
+        raise HTTPException(400,detail={'code':'QUOTE_REQUIRED','message':'A current server quote is required before posting a sale','request_id':req,'fresh_quote':q})
+    if supplied_quote not in (q['quote_hash'],q['quote_id']):
         raise HTTPException(409, detail={"code":"QUOTE_STALE","message":"The quote changed before posting","request_id":req,"fresh_quote":q})
     if not q['lines']:raise HTTPException(400,'Invoice must contain at least one item')
     cash=money(payload.get('payment_cash'));card=money(payload.get('payment_card'));upi=money(payload.get('payment_upi'));credit=money(payload.get('payment_credit'));paid=money_sum((cash,card,upi,credit,old_value))
@@ -171,9 +205,13 @@ def post_sale(conn,payload,user,client_ip=None):
         ('old_gold', old_value, '1210', refs.get('old_gold')),
     ], user['id'], now)
     for l in q['lines']:
-        u=conn.execute("UPDATE items SET status='sold',version=version+1,updated_at=? WHERE id=? AND status='in_stock'",(now,l['item_id']))
-        if u.rowcount!=1:raise HTTPException(409,f"Tag {l['tag_no']} was sold/moved by another counter")
-        conn.execute('INSERT INTO sale_items(sale_id,item_id,tag_no,description,metal,purity,gross_weight,net_weight,metal_rate,metal_value,wastage_value,making_charge,stone_value,discount,taxable,gst_rate,gst_amount,line_total,cost_amount,gross_mg,net_mg,metal_rate_paise,metal_value_paise,wastage_value_paise,making_charge_paise,stone_value_paise,discount_paise,taxable_paise,gst_amount_paise,line_total_paise,cost_amount_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,l['item_id'],l['tag_no'],l['description'],l['metal'],l['purity'],l['gross_weight'],l['net_weight'],l['metal_rate'],l['metal_value'],l['wastage_value'],l['making_charge'],l['stone_value'],l['discount'],l['taxable'],l['gst_rate'],l['gst_amount'],l['line_total'],l['cost_amount'],weight_mg(l['gross_weight']),weight_mg(l['net_weight']),money_paise(l['metal_rate']),money_paise(l['metal_value']),money_paise(l['wastage_value']),money_paise(l['making_charge']),money_paise(l['stone_value']),money_paise(l['discount']),money_paise(l['taxable']),money_paise(l['gst_amount']),money_paise(l['line_total']),money_paise(l['cost_amount'])));cost=money(cost+l['cost_amount']);conn.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(l['item_id'],'sale','sale',sid,f'branch:{bid}','customer',l['gross_weight'],user['id'],inv,now))
+        params=[now,l['item_id'],bid]
+        where="id=? AND status='in_stock' AND branch_id=?"
+        if counter is not None:
+            where += " AND (counter_id IS NULL OR counter_id=?)";params.append(counter)
+        u=conn.execute("UPDATE items SET status='sold',version=version+1,updated_at=? WHERE "+where,params)
+        if u.rowcount!=1:raise HTTPException(409,detail={'code':'STOCK_CHANGED','message':f"Tag {l['tag_no']} was sold, moved, or reassigned by another counter"})
+        conn.execute('INSERT INTO sale_items(sale_id,item_id,tag_no,description,metal,purity,gross_weight,net_weight,metal_rate,metal_value,wastage_value,making_charge,stone_value,discount,taxable,gst_rate,gst_amount,line_total,cost_amount,gross_mg,net_mg,metal_rate_paise,metal_value_paise,wastage_value_paise,making_charge_paise,stone_value_paise,discount_paise,taxable_paise,gst_amount_paise,line_total_paise,cost_amount_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,l['item_id'],l['tag_no'],l['description'],l['metal'],l['purity'],l['gross_weight'],l['net_weight'],l['metal_rate'],l['metal_value'],l['wastage_value'],l['making_charge'],l['stone_value'],l['discount'],l['taxable'],l['gst_rate'],l['gst_amount'],l['line_total'],l['cost_amount'],weight_mg(l['gross_weight']),weight_mg(l['net_weight']),money_paise(l['metal_rate']),money_paise(l['metal_value']),money_paise(l['wastage_value']),money_paise(l['making_charge']),money_paise(l['stone_value']),money_paise(l['discount']),money_paise(l['taxable']),money_paise(l['gst_amount']),money_paise(l['line_total']),money_paise(l['cost_amount'])));cost=money(cost+l['cost_amount']);conn.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(l['item_id'],'sale','sale',sid,f'branch:{bid}/counter:{counter}','customer',l['gross_weight'],user['id'],inv,now))
     for og in olds:
         gross=weight(og.get('gross_weight'));ded=decimal_value(og.get('deduction_percent',0));net=weight(weight_decimal(gross)*(decimal_value(100)-ded)/decimal_value(100));pure=weight(weight_decimal(net)*decimal_value(purity_fraction(str(og.get('purity','999')))));conn.execute('INSERT INTO old_gold(sale_id,customer_id,metal,purity,gross_weight,deduction_percent,net_weight,pure_weight,rate,value,notes,received_at,received_by,gross_mg,net_mg,pure_mg,rate_paise,value_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,cid,og.get('metal','Gold'),og.get('purity','999'),gross,ded,net,pure,money(og.get('rate')),money(og.get('value')),og.get('notes'),now,user['id'],weight_mg(gross),weight_mg(net),weight_mg(pure),money_paise(og.get('rate')),money_paise(og.get('value'))))
     if cid and credit:
@@ -296,7 +334,11 @@ def update_item(conn,item_id,data,user,client_ip=None):
     old=conn.execute('SELECT * FROM items WHERE id=?',(item_id,)).fetchone()
     if not old:raise HTTPException(404,'Item not found')
     expected_version=data.get('expected_version')
-    if expected_version is not None and int(expected_version)!=int(old['version']):
+    if expected_version in (None,''):
+        raise HTTPException(400,detail={'code':'VERSION_REQUIRED','message':'expected_version is required when updating an item','item_id':item_id,'current_version':old['version']})
+    try:expected_version=int(expected_version)
+    except (TypeError,ValueError):raise HTTPException(400,detail={'code':'INVALID_VERSION','message':'expected_version must be an integer'})
+    if expected_version!=int(old['version']):
         raise HTTPException(409,detail={'code':'VERSION_CONFLICT','message':'This item changed on another workstation; reload before saving','item_id':item_id,'current_version':old['version']})
     critical={'barcode','name','category','metal','purity','gross_weight','stone_weight','net_weight','fine_weight','stone_value','cost_amount','making_type','making_value','wastage_percent','huid','rfid_epc','hsn_code','gst_rate','counter_id','supplier_id'}
     if old['status']!='in_stock' and any(k in data for k in critical):raise HTTPException(409,f"Tag {old['tag_no']} is {old['status']}; return it to in-stock before changing controlled item data")
@@ -307,10 +349,8 @@ def update_item(conn,item_id,data,user,client_ip=None):
     if gst_rate<0 or gst_rate>100:raise HTTPException(400,'GST rate must be between 0 and 100')
     if v.get('counter_id') and not conn.execute('SELECT id FROM counters WHERE id=? AND branch_id=? AND active=1',(v['counter_id'],old['branch_id'])).fetchone():raise HTTPException(400,'Counter does not belong to this item branch')
     try:
-        params=(v['barcode'],v['name'],v['category'],v['metal'],v['purity'],gross,stone,net,fine,money(v['stone_value']),money(v['cost_amount']),making_type,making_value,wastage,huid,v['certificate_no'],v['rfid_epc'],v['hsn_code'],gst_rate,v['counter_id'],v['supplier_id'],v['notes'],override_reason,weight_mg(gross),weight_mg(stone),weight_mg(net),weight_mg(fine),money_paise(v['stone_value']),money_paise(v['cost_amount']),now,item_id)
-        where=' WHERE id=?'
-        if expected_version is not None:where+=' AND version=?';params += (int(expected_version),)
-        updated=conn.execute('UPDATE items SET barcode=?,name=?,category=?,metal=?,purity=?,gross_weight=?,stone_weight=?,net_weight=?,fine_weight=?,stone_value=?,cost_amount=?,making_type=?,making_value=?,wastage_percent=?,huid=?,certificate_no=?,rfid_epc=?,hsn_code=?,gst_rate=?,counter_id=?,supplier_id=?,notes=?,net_weight_override_reason=?,gross_mg=?,stone_mg=?,net_mg=?,fine_mg=?,stone_value_paise=?,cost_amount_paise=?,version=version+1,updated_at=?'+where,params)
+        params=(v['barcode'],v['name'],v['category'],v['metal'],v['purity'],gross,stone,net,fine,money(v['stone_value']),money(v['cost_amount']),making_type,making_value,wastage,huid,v['certificate_no'],v['rfid_epc'],v['hsn_code'],gst_rate,v['counter_id'],v['supplier_id'],v['notes'],override_reason,weight_mg(gross),weight_mg(stone),weight_mg(net),weight_mg(fine),money_paise(v['stone_value']),money_paise(v['cost_amount']),now,item_id,expected_version)
+        updated=conn.execute('UPDATE items SET barcode=?,name=?,category=?,metal=?,purity=?,gross_weight=?,stone_weight=?,net_weight=?,fine_weight=?,stone_value=?,cost_amount=?,making_type=?,making_value=?,wastage_percent=?,huid=?,certificate_no=?,rfid_epc=?,hsn_code=?,gst_rate=?,counter_id=?,supplier_id=?,notes=?,net_weight_override_reason=?,gross_mg=?,stone_mg=?,net_mg=?,fine_mg=?,stone_value_paise=?,cost_amount_paise=?,version=version+1,updated_at=? WHERE id=? AND version=?',params)
         if updated.rowcount!=1:raise HTTPException(409,detail={'code':'VERSION_CONFLICT','message':'This item changed on another workstation; reload before saving','item_id':item_id})
     except sqlite3.IntegrityError as e:raise HTTPException(409,f'Duplicate barcode/HUID/RFID or invalid item data: {e}')
     audit(conn,user_id,'update','item',item_id,{'changes':data,'gross_weight':gross,'stone_weight':stone,'net_weight':net,'net_weight_override_reason':override_reason},client_ip);return dict(conn.execute('SELECT * FROM items WHERE id=?',(item_id,)).fetchone())

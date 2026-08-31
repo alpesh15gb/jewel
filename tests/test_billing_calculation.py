@@ -18,6 +18,9 @@ SCREENSHOT_ITEM = {
     "gst_rate": 3,
     "cost_amount": 0,
     "status": "in_stock",
+    "branch_id": 1,
+    "counter_id": 1,
+    "version": 1,
 }
 
 
@@ -58,6 +61,8 @@ def test_invoice_discount_requotes_taxable_gst_and_roundoff():
         [{"item_id": 1, "metal_rate": 14550}],
         header_discount=1000,
         old_gold_value=0,
+        context={"branch_id": 1, "counter_id": 1},
+        trusted_overrides=True,
     )
     assert quote["subtotal"] == 72241.02
     assert quote["discount"] == 1000.0
