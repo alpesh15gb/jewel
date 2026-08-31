@@ -12,7 +12,7 @@ from .db import audit,business_date,business_now,day_is_closed,get_settings,init
 from .discovery import DiscoveryResponder
 from .pdfs import credit_note_pdf,invoice_pdf,label_pdf,stock_report_pdf
 from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
-from .services import _journal,cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,transfer_item,update_item,weight
+from .services import _journal,cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,require_client_request_id,transfer_item,update_item,weight
 from .returns import cancel_sale_return,list_returns,post_sale_return,quote_sale_return,return_detail
 from .integrity import database_integrity,day_close
 from .precision import mg_weight,money_paise,money_sum,paise_money
@@ -20,7 +20,7 @@ from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,ge
 from .tls import tls_identity
 
 PRODUCTION_HARDENED_V1 = True
-APP_VERSION='1.2.0-rc3'
+APP_VERSION='1.2.0-rc5'
 backup_worker=None;discovery=None;tally_worker=None
 @asynccontextmanager
 async def lifespan(app):
@@ -180,10 +180,13 @@ def items(q:str='',status:str='',branch_id:int|None=None,category:str='',limit:i
     a.append(limit);sql='SELECT * FROM items'+(' WHERE '+' AND '.join(w) if w else '')+' ORDER BY id DESC LIMIT ?'
     with read_db() as c:return rowsdict(c.execute(sql,a).fetchall())
 @app.get('/api/items/barcode/{code}')
-def by_barcode(code:str,u=Depends(require('inventory.read'))):
+def by_barcode(code:str,branch_id:int|None=None,counter_id:int|None=None,u=Depends(require('inventory.read'))):
     with read_db() as c:
-        r=c.execute('SELECT * FROM items WHERE barcode=? COLLATE NOCASE OR tag_no=? COLLATE NOCASE OR rfid_epc=?',(code,code,code)).fetchone()
-        if not r:raise HTTPException(404,'Tag/barcode not found')
+        where='(barcode=? COLLATE NOCASE OR tag_no=? COLLATE NOCASE OR rfid_epc=?)';args=[code,code,code]
+        if branch_id is not None:where+=' AND branch_id=?';args.append(branch_id)
+        if counter_id is not None:where+=' AND (counter_id IS NULL OR counter_id=?)';args.append(counter_id)
+        r=c.execute('SELECT * FROM items WHERE '+where,args).fetchone()
+        if not r:raise HTTPException(404,'Tag/barcode not found in the selected branch/counter')
         out=dict(r)
         try:out['current_rate']=latest_rate(c,r['metal'],r['purity'])
         except:out['current_rate']=0
@@ -263,7 +266,10 @@ def karigar_add(p:dict=Body(...),u=Depends(require('contacts'))):
 @app.post('/api/sales/quote')
 def sales_quote(p:dict=Body(...),u=Depends(require('sales'))):
     context={'branch_id':p.get('branch_id'),'counter_id':p.get('counter_id')}
-    with read_db() as c:return quote_sale(c,p.get('lines') or [],p.get('discount',0),money_sum(x.get('value',0) for x in p.get('old_gold') or []),context)
+    with read_db() as c:
+        if context['branch_id'] not in (None,'') and not valid_branch_counter(c,int(context['branch_id']),int(context['counter_id']) if context['counter_id'] not in (None,'') else None):
+            raise HTTPException(400,detail={'code':'INVALID_LOCATION','message':'The selected branch and counter are not a valid active pairing'})
+        return quote_sale(c,p.get('lines') or [],p.get('discount',0),money_sum(x.get('value',0) for x in p.get('old_gold') or []),context)
 @app.post('/api/sales')
 def sale(req:Request,p:dict=Body(...),u=Depends(require('sales'))):
     with write_db() as c:return post_sale(c,p,u,ip(req))
@@ -341,15 +347,14 @@ def returns_cancel(rid:int,req:Request,p:dict=Body(default={}),u=Depends(require
 
 @app.post('/api/purchases')
 def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
-    req=str(p.get('client_request_id') or '').strip() or None
+    req=require_client_request_id(p,'purchase')
     fingerprint=request_fingerprint('purchase',p)
     with write_db() as c:
-        if req:
-            old=c.execute('SELECT id,purchase_no,total,request_fingerprint FROM purchases WHERE client_request_id=?',(req,)).fetchone()
-            if old:
-                if old['request_fingerprint'] and old['request_fingerprint'] != fingerprint:
-                    raise HTTPException(409,detail={'code':'IDEMPOTENCY_CONFLICT','message':'This request ID was already used for different purchase data','request_id':req})
-                return dict(old)|{'idempotent':True}
+        old=c.execute('SELECT id,purchase_no,total,request_fingerprint FROM purchases WHERE client_request_id=?',(req,)).fetchone()
+        if old:
+            if old['request_fingerprint'] and old['request_fingerprint'] != fingerprint:
+                raise HTTPException(409,detail={'code':'IDEMPOTENCY_CONFLICT','message':'This request ID was already used for different purchase data','request_id':req})
+            return dict(old)|{'idempotent':True}
         its=p.get('items') or []
         if not its:raise HTTPException(400,'Purchase must have at least one item')
         no=next_sequence(c,'purchase','PUR-'+business_now(c).strftime('%y%m')+'-',6);now=utcnow();business_day=business_date(c);sid=p.get('supplier_id') or None;bid=int(p.get('branch_id') or 1);counter=p.get('counter_id') or None;counter=int(counter) if counter is not None else None
@@ -360,7 +365,7 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
         cur=c.execute('INSERT INTO purchases(purchase_no,client_request_id,request_fingerprint,print_snapshot_json,supplier_id,branch_id,counter_id,business_date,subtotal,gst,total,paid,notes,user_id,created_at,subtotal_paise,gst_paise,total_paise,paid_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,req,fingerprint,'{}',sid,bid,counter,business_day,sub,gst,total,paid,p.get('notes'),u['id'],now,money_paise(sub),money_paise(gst),money_paise(total),money_paise(paid)));pid=cur.lastrowid
         refs=p.get('payment_references') if isinstance(p.get('payment_references'),dict) else {}
         if paid:
-            c.execute("INSERT INTO payments(transaction_type,transaction_id,method,direction,amount_paise,reference,account_code,paid_at,actor_id) VALUES('purchase',?,?,?,?,?,?,?,?)",(pid,'cash','in',money_paise(paid),refs.get('cash'),'1000',now,u['id']))
+            c.execute("INSERT INTO payments(transaction_type,transaction_id,method,direction,amount_paise,reference,account_code,paid_at,actor_id) VALUES('purchase',?,?,?,?,?,?,?,?)",(pid,'cash','out',money_paise(paid),refs.get('cash'),'1000',now,u['id']))
         for x in its:
             x=dict(x);x.update({'branch_id':bid,'supplier_id':sid,'ref_type':'purchase','ref_id':pid});it=create_item(c,x,u);c.execute('INSERT INTO purchase_items(purchase_id,item_id,cost_amount,gst_amount,cost_amount_paise,gst_amount_paise) VALUES(?,?,?,0,?,0)',(pid,it['id'],it['cost_amount'],money_paise(it['cost_amount'])))
         payable=money(total-paid)
@@ -457,36 +462,52 @@ def audit_scan(aid:int,p:dict=Body(...),u=Depends(require('audit'))):
         try:c.execute('INSERT INTO stock_audit_scans(audit_id,item_id,scanned_by,scanned_at) VALUES(?,?,?,?)',(aid,it['id'],u['id'],utcnow()));new=True
         except:new=False
         return {'item':dict(it),'new':new}
+
+def _audit_calc_conn(c,aid):
+    a=c.execute('SELECT * FROM stock_audits WHERE id=?',(aid,)).fetchone()
+    if not a:raise HTTPException(404,'Audit not found')
+    exp=rowsdict(c.execute('SELECT i.* FROM stock_audit_expected e JOIN items i ON i.id=e.item_id WHERE e.audit_id=? ORDER BY i.tag_no',(aid,)).fetchall())
+    if not exp:
+        params=[a['branch_id']];where="i.status='in_stock' AND i.branch_id=?"
+        if a['counter_id'] is not None:where+=' AND i.counter_id=?';params.append(a['counter_id'])
+        exp=rowsdict(c.execute(f'SELECT i.* FROM items i WHERE {where} ORDER BY i.tag_no',params).fetchall())
+    scan=rowsdict(c.execute('SELECT i.* FROM stock_audit_scans s JOIN items i ON i.id=s.item_id WHERE s.audit_id=? ORDER BY s.id',(aid,)).fetchall());ei={x['id'] for x in exp};si={x['id'] for x in scan}
+    movement_conflicts=[]
+    snap=int(a['snapshot_movement_id'] or 0)
+    if snap:
+        branch_marker=f"branch:{a['branch_id']}%"
+        movement_conflicts=rowsdict(c.execute("""SELECT sm.id,sm.item_id,sm.movement_type,sm.ref_type,sm.ref_id,sm.created_at,i.tag_no
+            FROM stock_movements sm LEFT JOIN items i ON i.id=sm.item_id
+            WHERE sm.id>? AND (
+              EXISTS(SELECT 1 FROM stock_audit_expected e WHERE e.audit_id=? AND e.item_id=sm.item_id)
+              OR sm.from_location LIKE ? OR sm.to_location LIKE ?
+            ) ORDER BY sm.id LIMIT 200""",(snap,aid,branch_marker,branch_marker)).fetchall())
+    version_conflicts=rowsdict(c.execute("""SELECT i.id item_id,i.tag_no,e.version_at_start,i.version current_version,e.status_at_start,i.status current_status,i.branch_id,i.counter_id
+        FROM stock_audit_expected e JOIN items i ON i.id=e.item_id
+        WHERE e.audit_id=? AND (
+          i.version<>e.version_at_start OR i.status<>e.status_at_start OR i.branch_id<>? OR
+          (? IS NOT NULL AND coalesce(i.counter_id,-1)<>?)
+        ) ORDER BY i.id LIMIT 200""",(aid,a['branch_id'],a['counter_id'],a['counter_id'])).fetchall())
+    return {'audit':dict(a),'expected_count':len(exp),'scanned_count':len(scan),'missing':[x for x in exp if x['id'] not in si],'extra':[x for x in scan if x['id'] not in ei],'movement_conflicts':movement_conflicts,'version_conflicts':version_conflicts}
+
 def audit_calc(aid):
-    with read_db() as c:
-        a=c.execute('SELECT * FROM stock_audits WHERE id=?',(aid,)).fetchone()
-        if not a:raise HTTPException(404,'Audit not found')
-        exp=rowsdict(c.execute('SELECT i.* FROM stock_audit_expected e JOIN items i ON i.id=e.item_id WHERE e.audit_id=? ORDER BY i.tag_no',(aid,)).fetchall())
-        if not exp:
-            params=[a['branch_id']];where="i.status='in_stock' AND i.branch_id=?"
-            if a['counter_id'] is not None:where+=' AND i.counter_id=?';params.append(a['counter_id'])
-            exp=rowsdict(c.execute(f'SELECT i.* FROM items i WHERE {where} ORDER BY i.tag_no',params).fetchall())
-        scan=rowsdict(c.execute('SELECT i.* FROM stock_audit_scans s JOIN items i ON i.id=s.item_id WHERE s.audit_id=? ORDER BY s.id',(aid,)).fetchall());ei={x['id'] for x in exp};si={x['id'] for x in scan}
-        movement_conflicts=[]
-        snap=int(a['snapshot_movement_id'] or 0)
-        if snap:
-            movement_conflicts=rowsdict(c.execute("SELECT sm.id,sm.item_id,sm.movement_type,sm.ref_type,sm.ref_id,sm.created_at,i.tag_no FROM stock_movements sm JOIN items i ON i.id=sm.item_id WHERE i.branch_id=? AND sm.id>? ORDER BY sm.id LIMIT 200",(a['branch_id'],snap)).fetchall())
-        return {'audit':dict(a),'expected_count':len(exp),'scanned_count':len(scan),'missing':[x for x in exp if x['id'] not in si],'extra':[x for x in scan if x['id'] not in ei],'movement_conflicts':movement_conflicts}
+    with read_db() as c:return _audit_calc_conn(c,aid)
 @app.get('/api/stock-audits/{aid}/result')
 def audit_result(aid:int,u=Depends(require('audit'))):return audit_calc(aid)
 @app.post('/api/stock-audits/{aid}/close')
 def audit_close(aid:int,p:dict=Body(default={}),u=Depends(require('audit'))):
-    result=audit_calc(aid);conflicts=result.get('movement_conflicts') or []
     force=bool(p.get('resolve_movements'))
-    if conflicts and not force:raise HTTPException(409,detail={'code':'AUDIT_MOVEMENT_CONFLICT','message':'Stock moved after this audit snapshot; review or explicitly resolve before closing','conflicts':conflicts})
     if force and u['role'] not in ('admin','manager'):raise HTTPException(403,'Manager permission required to resolve audit movement conflicts')
     if force and len(str(p.get('reason') or '').strip())<3:raise HTTPException(400,'A reason is required to resolve audit movement conflicts')
     with write_db() as c:
         row=c.execute("SELECT id,status FROM stock_audits WHERE id=?",(aid,)).fetchone()
         if not row:raise HTTPException(404,'Audit not found')
-        if row['status']=='closed':return audit_calc(aid)
-        c.execute("UPDATE stock_audits SET status='closed',closed_at=? WHERE id=?",(utcnow(),aid));audit(c,u['id'],'close','stock_audit',aid,{'resolve_movements':force,'reason':str(p.get('reason') or '')})
-    return audit_calc(aid)
+        result=_audit_calc_conn(c,aid)
+        if row['status']=='closed':return result
+        conflicts=(result.get('movement_conflicts') or [])+(result.get('version_conflicts') or [])
+        if conflicts and not force:raise HTTPException(409,detail={'code':'AUDIT_MOVEMENT_CONFLICT','message':'Stock changed after this audit snapshot; review or explicitly resolve before closing','conflicts':conflicts})
+        c.execute("UPDATE stock_audits SET status='closed',closed_at=? WHERE id=?",(utcnow(),aid));audit(c,u['id'],'close','stock_audit',aid,{'resolve_movements':force,'reason':str(p.get('reason') or ''),'conflict_count':len(conflicts)})
+        return _audit_calc_conn(c,aid)
 
 @app.get('/api/tally/status')
 def tally_status(u=Depends(require('reports'))):
@@ -566,12 +587,13 @@ def integrity_report(u=Depends(require('reports'))):
 
 
 @app.get('/api/reports/day-close')
-def day_close_report(date:str='',u=Depends(require('reports'))):
+def day_close_report(date:str='',branch_id:int=1,u=Depends(require('reports'))):
     with read_db() as c:
         report_date=date or business_date(c)
         try:dt.date.fromisoformat(report_date)
         except ValueError:raise HTTPException(400,'Date must be YYYY-MM-DD')
-        return day_close(c,report_date)
+        if not c.execute('SELECT 1 FROM branches WHERE id=? AND active=1',(branch_id,)).fetchone():raise HTTPException(400,'Branch is not active')
+        return day_close(c,report_date,branch_id)
 
 
 @app.get('/api/day-close/status')
@@ -589,9 +611,10 @@ def day_close_post(p:dict=Body(default={}),u=Depends(require('reports'))):
         report_date=str(p.get('business_date') or business_date(c))
         try:dt.date.fromisoformat(report_date)
         except ValueError:raise HTTPException(400,'Business date must be YYYY-MM-DD')
+        if not c.execute('SELECT 1 FROM branches WHERE id=? AND active=1',(branch_id,)).fetchone():raise HTTPException(400,'Branch is not active')
         existing=c.execute("SELECT * FROM day_closes WHERE branch_id=? AND business_date=?",(branch_id,report_date)).fetchone()
         if existing and existing['status']=='closed':return {'ok':True,'already_closed':True,'record':dict(existing)}
-        report=day_close(c,report_date);integrity=database_integrity(c)
+        report=day_close(c,report_date,branch_id);integrity=database_integrity(c)
         checks_ok=bool(integrity.get('ok')) and bool(report.get('journal',{}).get('balanced')) and bool(report.get('sales',{}).get('payments_match_sales')) and bool(report.get('returns',{}).get('refunds_match_returns'))
         if not checks_ok:
             raise HTTPException(409,detail={'code':'DAY_CLOSE_BLOCKED','message':'Day close is blocked by reconciliation or data-health failures','report':report,'integrity':integrity})
@@ -601,8 +624,8 @@ def day_close_post(p:dict=Body(default={}),u=Depends(require('reports'))):
             c.execute("UPDATE day_closes SET status='closed',evidence_json=?,evidence_hash=?,closed_by=?,closed_at=?,reopened_by=NULL,reopened_at=NULL,reopen_reason=NULL WHERE id=?",(evidence_json,evidence_hash,u['id'],now,existing['id']));close_id=existing['id']
         else:
             close_id=c.execute("INSERT INTO day_closes(branch_id,business_date,status,evidence_json,evidence_hash,closed_by,closed_at) VALUES(?,?,'closed',?,?,?,?)",(branch_id,report_date,evidence_json,evidence_hash,u['id'],now)).lastrowid
-        audit(c,u['id'],'close','day_close',close_id,{'business_date':report_date,'evidence_hash':evidence_hash})
-        return {'ok':True,'id':close_id,'business_date':report_date,'evidence_hash':evidence_hash,'report':report}
+        audit(c,u['id'],'close','day_close',close_id,{'business_date':report_date,'branch_id':branch_id,'evidence_hash':evidence_hash})
+        return {'ok':True,'id':close_id,'business_date':report_date,'branch_id':branch_id,'evidence_hash':evidence_hash,'report':report}
 
 
 @app.post('/api/day-close/{business_day}/reopen')
