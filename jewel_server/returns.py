@@ -220,11 +220,13 @@ def post_sale_return(conn, sale_id: int, payload: dict[str, Any], user: dict[str
     )
     return_id = int(cur.lastrowid)
     refs = payload.get("refund_references") if isinstance(payload.get("refund_references"), dict) else {}
+    # _record_payments expects RUPEES (it calls money_paise itself).
+    # refund_* here are paise ints — convert back to rupees to avoid 100x bug.
     _record_payments(conn, "sale_return", return_id, [
-        ("cash", refund_cash, "1000", refs.get("cash")),
-        ("card", refund_card, "1010", refs.get("card")),
-        ("upi", refund_upi, "1010", refs.get("upi")),
-        ("credit", refund_credit, "1100", refs.get("credit")),
+        ("cash", _rupees(refund_cash), "1000", refs.get("cash")),
+        ("card", _rupees(refund_card), "1010", refs.get("card")),
+        ("upi", _rupees(refund_upi), "1010", refs.get("upi")),
+        ("credit", _rupees(refund_credit), "1100", refs.get("credit")),
     ], user["id"], now, direction="out")
 
     for line, taxable, gst, ro, line_total, cost, disposition in selected:

@@ -4,7 +4,7 @@
 
 JewelLAN is being built for jewellery showrooms that must continue billing even when the internet is unavailable. One Windows PC runs the central JewelLAN server and local SQLite database; counter/office PCs run JewelLAN POS and connect to the server over the shop's private LAN.
 
-> **Release status:** current software line is **1.2.0-rc5** (Windows file version `1.2.0.4`). The automated Windows release pipeline is green, but JewelLAN is still a **release candidate under shop UAT**. Do not treat this README as a statement that the product is certified for live production billing yet.
+> **Release status:** current software line is **1.2.0-rc6** (Windows file version `1.2.0.5`). The automated Windows release pipeline is green, but JewelLAN is still a **release candidate under shop UAT**. Do not treat this README as a statement that the product is certified for live production billing yet.
 
 ## Current architecture
 
@@ -411,7 +411,7 @@ Still required:
 
 ## P1 — Opening-stock/bulk import
 
-A production-quality opening-stock workflow is still required for shops loading a significant first-day inventory.
+Implemented in rc6: Inventory → Bulk CSV with preview, per-row validation, duplicate detection, weight-equation checks, atomic all-or-nothing post via `/api/opening-stock`, batch reference + audit record, row-numbered error report. XLSX template and current-stock export remain future polish. Performance script: `python scripts/bulk_perf_check.py --count 2000`.
 
 Target requirements:
 
@@ -428,7 +428,7 @@ Target requirements:
 
 ## P1 — Dedicated exchange workflow
 
-Item return/credit note is implemented, and a replacement item can be sold separately. A polished one-screen **Exchange** workflow should still link:
+Implemented in rc6: Exchange page links original return/credit note → exchange credit → new sale → net balance with audit trail and Tally entries. Item return/credit note is implemented, and a replacement item can be sold separately. A polished one-screen **Exchange** workflow should still link:
 
 1. original sale return/credit note;
 2. exchange credit;
@@ -466,7 +466,7 @@ Required after choosing actual hardware:
 
 ## P1 — Direct label-printer command support
 
-Current labels are PDF/Windows-printer based. Native ZPL/TSPL workflows are future hardware adapters and must be tested against the actual printer model before being claimed as supported.
+Implemented in rc6: offline PDF + native ZPL (Zebra) + TSPL (TSC) generation with same mm sizing, single + bulk (max 100), Serial COM / TCP 9100 direct send or file save. Must still be tested against the actual printer model and tag stock before being claimed as supported for that model.
 
 ## P1 — Weighing-scale hardware qualification
 
@@ -653,10 +653,10 @@ See `docs/OPERATIONS.md` and `docs/PRODUCTION_ACCEPTANCE.md`.
 | Manual metal rates | Implemented baseline |
 | Rate amendment/day-opening workflow | **Remaining P0** |
 | Live gold/silver rate sync | **Not implemented** |
-| Bulk opening-stock import | **Remaining P1** |
-| Dedicated exchange wizard | **Remaining P1** |
+| Bulk opening-stock import | Implemented rc6 (CSV preview + atomic) / XLSX + export polish left |
+| Dedicated exchange wizard | Implemented rc6 / shop UAT ongoing |
 | Direct RFID SDK | **Not implemented** |
-| Native ZPL/TSPL printing | **Not implemented** |
+| Native ZPL/TSPL printing | Implemented rc6 (PDF+ZPL+TSPL offline) / model-specific UAT required |
 | E-invoice/e-way bill adapters | **Not implemented** |
 | WhatsApp/payment reconciliation | **Not implemented** |
 | Direct BIS/HUID online verification | **Not implemented** |

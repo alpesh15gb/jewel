@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import tempfile
 import uuid
@@ -11,6 +12,10 @@ from tkinter import messagebox, simpledialog, ttk
 from .api import ApiError
 from .config import remove_pending_post, upsert_pending_post
 from .ui_theme import PALETTE, card, divider, status_pill
+
+
+def _utc_stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _money(value) -> str:
@@ -146,6 +151,11 @@ class ReturnsPage(ttk.Frame):
             ttk.Entry(summary, textvariable=var).pack(fill="x", ipady=2)
         ttk.Button(summary, text="Set full refund to cash", style="Secondary.TButton", command=self.full_cash).pack(fill="x", pady=(8, 10))
 
+        ttk.Label(summary, text="Disposition (returned stock)", style="SurfaceMuted.TLabel").pack(anchor="w", pady=(2, 2))
+        self.disposition = tk.StringVar(value="in_stock")
+        ttk.Combobox(summary, textvariable=self.disposition, values=["in_stock","damaged","scrap"], state="readonly").pack(fill="x", ipady=2)
+        ttk.Label(summary, text="in_stock = resaleable, damaged/scrap = quarantine.", style="SurfaceMuted.TLabel", wraplength=300).pack(anchor="w", pady=(2, 6))
+
         ttk.Label(summary, text="Return reason", style="SurfaceMuted.TLabel").pack(anchor="w", pady=(2, 2))
         ttk.Entry(summary, textvariable=self.reason).pack(fill="x", ipady=2)
         ttk.Label(
@@ -276,14 +286,21 @@ class ReturnsPage(ttk.Frame):
         self.quote = quote
         self.return_total.set(_money(quote.get("total", 0)))
         self._set_quote_status(f"{quote.get('selected_count', len(ids))} tag(s) · GST {_money(quote.get('gst',0))}", "success")
-        if not any(self._amount(v) for v in (self.refund_cash, self.refund_card, self.refund_upi, self.refund_credit)):
+        try:has_refund = any(self._amount(v) for v in (self.refund_cash, self.refund_card, self.refund_upi, self.refund_credit))
+        except ValueError:
+            self._show_error(ValueError("Refund amounts must be numeric — reset to 0.00"))
+            for v in (self.refund_cash, self.refund_card, self.refund_upi, self.refund_credit):
+                try:v.set("0.00")
+                except tk.TclError:pass
+            has_refund = False
+        if not has_refund:
             self.refund_cash.set(f"{float(quote.get('total',0)):.2f}")
 
     @staticmethod
     def _amount(var: tk.StringVar) -> float:
         try:
             return round(float(var.get().strip() or 0), 2)
-        except ValueError:
+        except (ValueError, tk.TclError):
             raise ValueError("Refund amounts must be numeric")
 
     def full_cash(self) -> None:
@@ -335,12 +352,13 @@ class ReturnsPage(ttk.Frame):
             "refund_upi": upi,
             "refund_credit": credit,
             "reason": reason,
+            "disposition": self.disposition.get().strip() or "in_stock",
         }
         upsert_pending_post({
             "request_id": request_id,
             "operation": "sale_return",
             "state": "submitting",
-            "created_at": uuid.uuid1().time,
+            "created_at": _utc_stamp(),
             "payload": {"sale_id": self.sale_id, **payload},
         })
         try:
@@ -352,7 +370,7 @@ class ReturnsPage(ttk.Frame):
                     "request_id": request_id,
                     "operation": "sale_return",
                     "state": "outcome_unknown",
-                    "created_at": uuid.uuid1().time,
+                    "created_at": _utc_stamp(),
                     "payload": {"sale_id": self.sale_id, **payload},
                     "error": str(exc),
                 })
@@ -422,8 +440,10 @@ class ReturnsPage(ttk.Frame):
         if not rid:
             return
         try:
-            data = self.api.get(f"/api/returns/{rid}/credit-note.pdf")
-            _open_pdf(data, f"{row.get('return_no','credit-note')}.pdf")
+            data = self.api.request("GET", f"/api/returns/{rid}/credit-note.pdf")
+            if isinstance(data, dict):
+                raise ValueError(f"Server returned JSON instead of PDF: {data}")
+            _open_pdf(bytes(data), f"{row.get('return_no','credit-note')}.pdf")
         except Exception as exc:
             self._show_error(exc)
 

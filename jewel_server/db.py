@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 APP_NAME = "JewelLAN"
 PRODUCTION_HARDENED_V1 = True
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 
 def app_data_dir() -> Path:
@@ -90,6 +90,50 @@ def rowdict(row): return dict(row) if row is not None else None
 def rowsdict(rows): return [dict(r) for r in rows]
 
 
+def _normalize_fingerprint_body(operation: str, body: Any) -> Any:
+    """Normalize volatile/order-insensitive fields so retries don't false-conflict.
+
+    - sale: drop quote_hash/quote_id/quote_version (server recomputes quote);
+      sort lines by item_id; sort old_gold by stable key; drop
+      payment_references (metadata, not money).
+    - sale_return: sort sale_item_ids; drop refund_references.
+    - purchase: sort items by stable key; drop payment_references.
+    """
+    if not isinstance(body, dict):
+        return body
+    b = dict(body)
+    if operation == "sale":
+        for k in ("quote_hash", "quote_id", "quote_version", "payment_references", "allow_old_gold_override", "old_gold_override_reason"):
+            b.pop(k, None)
+        lines = b.get("lines")
+        if isinstance(lines, list):
+            try:b["lines"] = sorted(lines, key=lambda x: int((x or {}).get("item_id") or 0) if isinstance(x, dict) else 0)
+            except Exception:pass
+        og = b.get("old_gold")
+        if isinstance(og, list):
+            def _k(x):
+                if not isinstance(x, dict):return str(x)
+                return (str(x.get("metal") or ""), str(x.get("purity") or ""), str(x.get("gross_weight") or ""), str(x.get("deduction_percent") or ""), str(x.get("rate") or ""), str(x.get("value") or ""))
+            try:b["old_gold"] = sorted(og, key=_k)
+            except Exception:pass
+    elif operation in ("sale_return", "return"):
+        ids = b.get("sale_item_ids")
+        if isinstance(ids, list):
+            try:b["sale_item_ids"] = sorted(int(x) for x in ids)
+            except Exception:pass
+        b.pop("refund_references", None)
+    elif operation == "purchase":
+        b.pop("payment_references", None)
+        its = b.get("items")
+        if isinstance(its, list):
+            def _k(x):
+                if not isinstance(x, dict):return str(x)
+                return (str(x.get("name") or ""), str(x.get("metal") or ""), str(x.get("purity") or ""), str(x.get("gross_weight") or ""), str(x.get("cost_amount") or ""))
+            try:b["items"] = sorted(its, key=_k)
+            except Exception:pass
+    return b
+
+
 def request_fingerprint(operation: str, payload: Any) -> str:
     """Return a stable fingerprint for an idempotent write payload.
 
@@ -99,6 +143,7 @@ def request_fingerprint(operation: str, payload: Any) -> str:
     if isinstance(payload, dict):
         body = dict(payload)
         body.pop("client_request_id", None)
+        body = _normalize_fingerprint_body(str(operation), body)
     else:
         body = payload
     raw = json.dumps(
@@ -627,7 +672,132 @@ def _migration_7(conn) -> None:
     )
 
 
-MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5), (6, _migration_6), (7, _migration_7))
+def _migration_8(conn) -> None:
+    """Offline parity: estimations, chit schemes, gold loans (all local, no internet)."""
+    _add_column_if_missing(conn, "customers", "birthday", "TEXT")
+    _add_column_if_missing(conn, "customers", "anniversary", "TEXT")
+    # loyalty_points already exists as REAL; keep it.
+    _add_column_if_missing(conn, "sales", "loyalty_redeemed", "REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "sales", "loyalty_earned", "REAL NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "sales", "loyalty_redeemed_paise", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "old_gold", "mode", "TEXT NOT NULL DEFAULT 'cash'")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS estimations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            est_no TEXT NOT NULL UNIQUE,
+            customer_id INTEGER REFERENCES customers(id),
+            branch_id INTEGER NOT NULL REFERENCES branches(id),
+            counter_id INTEGER REFERENCES counters(id),
+            subtotal_paise INTEGER NOT NULL DEFAULT 0,
+            discount_paise INTEGER NOT NULL DEFAULT 0,
+            taxable_paise INTEGER NOT NULL DEFAULT 0,
+            gst_paise INTEGER NOT NULL DEFAULT 0,
+            total_paise INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','converted','cancelled')),
+            converted_sale_id INTEGER REFERENCES sales(id),
+            notes TEXT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS estimation_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            estimation_id INTEGER NOT NULL REFERENCES estimations(id) ON DELETE CASCADE,
+            item_id INTEGER NOT NULL REFERENCES items(id),
+            tag_no TEXT NOT NULL,
+            description TEXT NOT NULL,
+            metal TEXT NOT NULL,
+            purity TEXT NOT NULL,
+            gross_weight REAL NOT NULL,
+            net_weight REAL NOT NULL,
+            metal_rate REAL NOT NULL,
+            metal_value REAL NOT NULL,
+            wastage_value REAL NOT NULL DEFAULT 0,
+            making_charge REAL NOT NULL,
+            stone_value REAL NOT NULL,
+            discount REAL NOT NULL DEFAULT 0,
+            taxable REAL NOT NULL,
+            gst_rate REAL NOT NULL,
+            gst_amount REAL NOT NULL,
+            line_total REAL NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chit_schemes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            metal TEXT NOT NULL DEFAULT 'Gold',
+            tenure_months INTEGER NOT NULL DEFAULT 11,
+            monthly_amount_paise INTEGER NOT NULL DEFAULT 0,
+            target_weight_mg INTEGER NOT NULL DEFAULT 0,
+            making_discount_percent REAL NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chit_members(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scheme_id INTEGER NOT NULL REFERENCES chit_schemes(id),
+            customer_id INTEGER NOT NULL REFERENCES customers(id),
+            start_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','closed','defaulted')),
+            total_paid_paise INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(scheme_id,customer_id,start_date)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chit_payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id INTEGER NOT NULL REFERENCES chit_members(id) ON DELETE CASCADE,
+            amount_paise INTEGER NOT NULL CHECK(amount_paise>0),
+            method TEXT NOT NULL DEFAULT 'cash',
+            paid_on TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS gold_loans(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            loan_no TEXT NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL REFERENCES customers(id),
+            gross_weight REAL NOT NULL,
+            net_weight REAL NOT NULL,
+            purity TEXT NOT NULL DEFAULT '916',
+            loan_amount_paise INTEGER NOT NULL CHECK(loan_amount_paise>0),
+            interest_monthly_percent REAL NOT NULL DEFAULT 2.0,
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed','auctioned')),
+            issued_on TEXT NOT NULL,
+            due_on TEXT,
+            closed_on TEXT,
+            notes TEXT,
+            user_id INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS gold_loan_payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            loan_id INTEGER NOT NULL REFERENCES gold_loans(id) ON DELETE CASCADE,
+            amount_paise INTEGER NOT NULL CHECK(amount_paise>0),
+            kind TEXT NOT NULL DEFAULT 'interest' CHECK(kind IN ('interest','principal','closure')),
+            paid_on TEXT NOT NULL,
+            user_id INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_est_customer ON estimations(customer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chit_member ON chit_members(scheme_id,customer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loan_customer ON gold_loans(customer_id,status)")
+    for seq in ("estimation", "chit", "goldloan"):
+        conn.execute("INSERT OR IGNORE INTO sequences(name,value) VALUES(?,0)", (seq,))
+
+
+MIGRATIONS = ((1, _migration_1), (2, _migration_2), (3, _migration_3), (4, _migration_4), (5, _migration_5), (6, _migration_6), (7, _migration_7), (8, _migration_8))
 
 def _migrate_schema(conn) -> None:
     applied = {int(r[0]) for r in conn.execute("SELECT version FROM schema_migrations").fetchall()}

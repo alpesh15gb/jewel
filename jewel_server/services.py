@@ -23,8 +23,12 @@ def purity_fraction(purity:str)->float:
     p=str(purity).upper().strip().replace('K','');known={'999':.999,'995':.995,'990':.990,'958':.958,'950':.950,'925':.925,'916':.916,'875':.875,'833':.833,'750':.750,'585':.585,'417':.417,'375':.375,'24':.999,'23':.958,'22':.916,'21':.875,'20':.833,'18':.750,'14':.585,'10':.417,'9':.375}
     if p in known:return known[p]
     try:
-        v=float(p);return min(v/1000 if v>24 else v/24,1)
-    except:return 1.0
+        v=float(p)
+        if not 0 < v <= 1000:raise ValueError
+        return min(v/1000 if v>24 else v/24,1)
+    except Exception:
+        from fastapi import HTTPException as _H
+        raise _H(400,f'Unknown purity {purity!r}')
 
 def _gst_state_code(value):
     s=str(value or '').strip()
@@ -50,7 +54,9 @@ def latest_rate(conn,metal,purity):
 def calculate_item_price(conn,item,overrides=None):
     i=dict(item);o=overrides or {}
     raw_rate=o.get('metal_rate')
-    rate_d=money_decimal(latest_rate(conn,i['metal'],i['purity']) if raw_rate in (None,'') else raw_rate)
+    try:rate_d=money_decimal(latest_rate(conn,i['metal'],i['purity']) if raw_rate in (None,'') else raw_rate)
+    except ValueError:raise HTTPException(400,'Metal rate must be numeric')
+    if rate_d<0:raise HTTPException(400,'Metal rate cannot be negative')
     net_d=weight_decimal(i['net_weight'])
     metal_d=money_decimal(net_d*rate_d)
     wp_d=decimal_value(o.get('wastage_percent',i.get('wastage_percent',0)))
@@ -64,7 +70,9 @@ def calculate_item_price(conn,item,overrides=None):
     elif making_type=='per_gram':making_d=money_decimal(net_d*making_value_d)
     else:raise HTTPException(400,'Invalid making type')
     stone_d=money_decimal(o.get('stone_value',i.get('stone_value',0)))
-    discount_d=money_decimal(o.get('discount',0))
+    if stone_d<0:raise HTTPException(400,'Stone value cannot be negative')
+    try:discount_d=money_decimal(o.get('discount',0))
+    except ValueError:raise HTTPException(400,'Discount must be numeric')
     if discount_d<0:raise HTTPException(400,'Discount cannot be negative')
     taxable_d=money_decimal(max(decimal_value(0),metal_d+wastage_d+making_d+stone_d-discount_d))
     gst_rate_d=decimal_value(o.get('gst_rate',i.get('gst_rate',3)))
@@ -104,8 +112,11 @@ def quote_sale(conn,lines,header_discount=0,old_gold_value=0,context=None,truste
             pricing_overrides={}
         out.append(calculate_item_price(conn,item,pricing_overrides))
     subtotal_d=sum((money_decimal(x['taxable']) for x in out),decimal_value(0))
-    requested_discount=money_decimal(max(decimal_value(0),decimal_value(header_discount)))
-    header_d=min(requested_discount,subtotal_d);remaining=header_d
+    try:requested_discount=money_decimal(max(decimal_value(0),decimal_value(header_discount)))
+    except ValueError:raise HTTPException(400,'Discount must be numeric')
+    if requested_discount - subtotal_d > decimal_value("0.005"):
+        raise HTTPException(400,detail={'code':'DISCOUNT_EXCEEDS_SUBTOTAL','message':f'Discount ({money(requested_discount):.2f}) cannot exceed subtotal ({money(subtotal_d):.2f})'})
+    header_d=requested_discount;remaining=header_d
     for n,line in enumerate(out):
         line_taxable=money_decimal(line['taxable'])
         if not header_d or not subtotal_d:allocation=money_decimal(0)
@@ -165,22 +176,74 @@ def post_sale(conn,payload,user,client_ip=None):
         if e['request_fingerprint'] and e['request_fingerprint'] != fingerprint:
             raise HTTPException(409, detail={"code":"IDEMPOTENCY_CONFLICT","message":"This request ID was already used for different sale data","request_id":req})
         return {'id':e['id'],'invoice_no':e['invoice_no'],'total':e['total'],'idempotent':True}
-    olds=payload.get('old_gold') or [];old_value=money_sum(x.get('value',0) for x in olds)
+    olds=payload.get('old_gold') or []
+    # Validate old-gold exchange lines with tolerance vs net*rate.
+    # Client value is used for totals, but a typo/inflation beyond tolerance
+    # needs an admin/manager override with reason (offline fraud guard).
+    role=str((user or {}).get('role') or '') if isinstance(user, dict) else ''
+    allow_og_override=bool(payload.get('allow_old_gold_override'))
+    og_reason=str(payload.get('old_gold_override_reason') or '').strip()
+    for og in olds:
+        try:
+            _g = weight(og.get('gross_weight', 0))
+            _ded = decimal_value(og.get('deduction_percent', 0))
+            _rate = money_decimal(og.get('rate', 0))
+            _val = money_decimal(og.get('value', 0))
+        except Exception:
+            raise HTTPException(400, 'Old-gold weights and amounts must be numeric')
+        if weight_mg(_g) <= 0:
+            raise HTTPException(400, 'Old-gold gross weight must be positive')
+        if _ded < 0 or _ded > 100:
+            raise HTTPException(400, 'Old-gold deduction % must be between 0 and 100')
+        if _rate < 0 or _val < 0:
+            raise HTTPException(400, 'Old-gold rate and value cannot be negative')
+        if _val <= 0:
+            raise HTTPException(400, 'Old-gold exchange value must be positive')
+        if _rate > 0:
+            _net = weight(weight_decimal(_g) * (decimal_value(100) - _ded) / decimal_value(100))
+            expected = money_decimal(weight_decimal(_net) * _rate)
+            diff = abs(_val - expected)
+            tol = max(money_decimal("2.00"), money_decimal(expected * decimal_value("0.02")))
+            if diff > tol:
+                if role in ('admin', 'manager') and allow_og_override and len(og_reason) >= 3:
+                    og['notes'] = f"OVERRIDE (exp {money(expected):.2f}): {og.get('notes') or ''}".strip()[:250]
+                else:
+                    raise HTTPException(400, detail={'code': 'OLD_GOLD_VALUE_MISMATCH', 'message': f"Old-gold value {_val:.2f} differs from net×rate {expected:.2f} (tolerance {tol:.2f}). Correct it or use a manager override with reason.", 'expected': money(expected), 'tolerance': money(tol)})
+    old_value=money_sum(x.get('value',0) for x in olds)
     bid=int(payload.get('branch_id') or 1);counter=payload.get('counter_id') or None;counter=int(counter) if counter is not None else None
+    # Offline loyalty: 1 pt = Rs 1 redeem, earn 1 pt per Rs 1000 net total.
+    try:loyalty_redeem=int(payload.get('loyalty_redeem_points') or 0)
+    except Exception:raise HTTPException(400,'Loyalty points must be numeric')
+    if loyalty_redeem<0:raise HTTPException(400,'Loyalty redeem cannot be negative')
+    cid_pre=payload.get('customer_id') or None
+    loyalty_value=money(loyalty_redeem)
+    if loyalty_redeem and not cid_pre:raise HTTPException(400,'Loyalty redeem requires a customer')
+    if loyalty_redeem:
+        row0=conn.execute('SELECT loyalty_points FROM customers WHERE id=?',(cid_pre,)).fetchone()
+        if not row0:raise HTTPException(400,'Customer not found')
+        try:bal_pts=int(float(row0['loyalty_points'] or 0))
+        except Exception:bal_pts=0
+        if loyalty_redeem>bal_pts:raise HTTPException(400,f'Customer has only {bal_pts} loyalty points')
+    try:header_disc=money_decimal(payload.get('discount',0))
+    except Exception:raise HTTPException(400,'Discount must be numeric')
+    effective_discount=money(money_decimal(header_disc)+money_decimal(loyalty_value))
     if not valid_branch_counter(conn,bid,counter):
         raise HTTPException(400, detail={"code":"INVALID_LOCATION","message":"The selected branch and counter are not a valid active pairing"})
     business_day=business_date(conn)
     if day_is_closed(conn,bid,business_day):
         raise HTTPException(409, detail={"code":"DAY_CLOSED","message":"This branch is closed for the current business date"})
     context={"branch_id":bid,"counter_id":counter}
-    q=quote_sale(conn,payload.get('lines') or [],payload.get('discount',0),old_value,context)
+    q=quote_sale(conn,payload.get('lines') or [],effective_discount,old_value,context)
     supplied_quote=payload.get('quote_hash') or payload.get('quote_id')
     if not supplied_quote:
         raise HTTPException(400,detail={'code':'QUOTE_REQUIRED','message':'A current server quote is required before posting a sale','request_id':req,'fresh_quote':q})
     if supplied_quote not in (q['quote_hash'],q['quote_id']):
         raise HTTPException(409, detail={"code":"QUOTE_STALE","message":"The quote changed before posting","request_id":req,"fresh_quote":q})
     if not q['lines']:raise HTTPException(400,'Invoice must contain at least one item')
-    cash=money(payload.get('payment_cash'));card=money(payload.get('payment_card'));upi=money(payload.get('payment_upi'));credit=money(payload.get('payment_credit'));paid=money_sum((cash,card,upi,credit,old_value))
+    try:cash=money(payload.get('payment_cash'));card=money(payload.get('payment_card'));upi=money(payload.get('payment_upi'));credit=money(payload.get('payment_credit'))
+    except ValueError:raise HTTPException(400,'Payment amounts must be numeric')
+    if min(cash,card,upi,credit)<0:raise HTTPException(400,'Payment amounts cannot be negative')
+    paid=money_sum((cash,card,upi,credit,old_value))
     if not money_equal(paid,q['total']):raise HTTPException(400,f"Payments ({paid:.2f}) must equal invoice total ({q['total']:.2f})")
     s=get_settings(conn);inv=next_sequence(conn,'invoice',s.get('invoice_prefix','INV')+'-'+business_now(conn).strftime('%y%m')+'-',6);now=utcnow();cid=payload.get('customer_id') or None
     if credit and not cid:raise HTTPException(400,'Credit payment requires a customer')
@@ -213,9 +276,23 @@ def post_sale(conn,payload,user,client_ip=None):
         if u.rowcount!=1:raise HTTPException(409,detail={'code':'STOCK_CHANGED','message':f"Tag {l['tag_no']} was sold, moved, or reassigned by another counter"})
         conn.execute('INSERT INTO sale_items(sale_id,item_id,tag_no,description,metal,purity,gross_weight,net_weight,metal_rate,metal_value,wastage_value,making_charge,stone_value,discount,taxable,gst_rate,gst_amount,line_total,cost_amount,gross_mg,net_mg,metal_rate_paise,metal_value_paise,wastage_value_paise,making_charge_paise,stone_value_paise,discount_paise,taxable_paise,gst_amount_paise,line_total_paise,cost_amount_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,l['item_id'],l['tag_no'],l['description'],l['metal'],l['purity'],l['gross_weight'],l['net_weight'],l['metal_rate'],l['metal_value'],l['wastage_value'],l['making_charge'],l['stone_value'],l['discount'],l['taxable'],l['gst_rate'],l['gst_amount'],l['line_total'],l['cost_amount'],weight_mg(l['gross_weight']),weight_mg(l['net_weight']),money_paise(l['metal_rate']),money_paise(l['metal_value']),money_paise(l['wastage_value']),money_paise(l['making_charge']),money_paise(l['stone_value']),money_paise(l['discount']),money_paise(l['taxable']),money_paise(l['gst_amount']),money_paise(l['line_total']),money_paise(l['cost_amount'])));cost=money(cost+l['cost_amount']);conn.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(l['item_id'],'sale','sale',sid,f'branch:{bid}/counter:{counter}','customer',l['gross_weight'],user['id'],inv,now))
     for og in olds:
-        gross=weight(og.get('gross_weight'));ded=decimal_value(og.get('deduction_percent',0));net=weight(weight_decimal(gross)*(decimal_value(100)-ded)/decimal_value(100));pure=weight(weight_decimal(net)*decimal_value(purity_fraction(str(og.get('purity','999')))));conn.execute('INSERT INTO old_gold(sale_id,customer_id,metal,purity,gross_weight,deduction_percent,net_weight,pure_weight,rate,value,notes,received_at,received_by,gross_mg,net_mg,pure_mg,rate_paise,value_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,cid,og.get('metal','Gold'),og.get('purity','999'),gross,ded,net,pure,money(og.get('rate')),money(og.get('value')),og.get('notes'),now,user['id'],weight_mg(gross),weight_mg(net),weight_mg(pure),money_paise(og.get('rate')),money_paise(og.get('value'))))
+        gross=weight(og.get('gross_weight'));ded_f=float(decimal_value(og.get('deduction_percent',0)));net=weight(weight_decimal(gross)*(decimal_value(100)-decimal_value(og.get('deduction_percent',0)))/decimal_value(100));pure=weight(weight_decimal(net)*decimal_value(purity_fraction(str(og.get('purity','999')))));mode=str(og.get('mode') or 'cash').strip().lower()
+        if mode not in ('cash','bhav_cut'):mode='cash'
+        conn.execute('INSERT INTO old_gold(sale_id,customer_id,metal,purity,gross_weight,deduction_percent,net_weight,pure_weight,rate,value,notes,received_at,received_by,gross_mg,net_mg,pure_mg,rate_paise,value_paise,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,cid,og.get('metal','Gold'),og.get('purity','999'),gross,ded_f,net,pure,money(og.get('rate')),money(og.get('value')),og.get('notes'),now,user['id'],weight_mg(gross),weight_mg(net),weight_mg(pure),money_paise(og.get('rate')),money_paise(og.get('value')),mode))
     if cid and credit:
         row=conn.execute('SELECT balance_paise FROM customers WHERE id=?',(cid,)).fetchone();newp=int(row['balance_paise'] or 0)+money_paise(credit);conn.execute('UPDATE customers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(paise_money(newp),newp,now,cid))
+    # Loyalty accrue/redeem offline
+    loyalty_earned=0
+    if cid:
+        try:
+            loyalty_earned=int(float(q['total'])//1000)
+        except Exception:loyalty_earned=0
+        try:cur_pts=int(float(conn.execute('SELECT loyalty_points FROM customers WHERE id=?',(cid,)).fetchone()['loyalty_points'] or 0))
+        except Exception:cur_pts=0
+        new_pts=max(0,cur_pts-loyalty_redeem+loyalty_earned)
+        conn.execute('UPDATE customers SET loyalty_points=?,updated_at=? WHERE id=?',(new_pts,now,cid))
+        try:conn.execute('UPDATE sales SET loyalty_redeemed=?,loyalty_earned=?,loyalty_redeemed_paise=? WHERE id=?',(loyalty_redeem,loyalty_earned,money_paise(loyalty_value),sid))
+        except Exception:pass
     jl=[]
     if cash:jl.append(('1000',cash,0,None,None))
     if card+upi:jl.append(('1010',money(card+upi),0,None,None))
@@ -245,12 +322,24 @@ def cancel_sale(conn,sale_id,user,reason='',client_ip=None):
         raise HTTPException(409,'Cannot cancel an invoice with an effective credit note')
     now=utcnow()
     for si in conn.execute('SELECT * FROM sale_items WHERE sale_id=?',(sale_id,)).fetchall():
-        item=conn.execute('SELECT status FROM items WHERE id=?',(si['item_id'],)).fetchone()
-        if item and item['status']!='sold':raise HTTPException(409,f"Cannot cancel: tag {si['tag_no']} is currently {item['status']}")
-        conn.execute("UPDATE items SET status='in_stock',version=version+1,updated_at=? WHERE id=?",(now,si['item_id']));conn.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(si['item_id'],'sale_cancel','sale',sale_id,'customer',f"branch:{sale['branch_id']}",si['gross_weight'],user['id'],reason,now))
+        upd=conn.execute("UPDATE items SET status='in_stock',version=version+1,updated_at=? WHERE id=? AND status='sold'",(now,si['item_id']))
+        if upd.rowcount!=1:
+            cur=conn.execute('SELECT status FROM items WHERE id=?',(si['item_id'],)).fetchone()
+            raise HTTPException(409,f"Cannot cancel: tag {si['tag_no']} is currently {(cur['status'] if cur else 'missing')}")
+        conn.execute('INSERT INTO stock_movements(item_id,movement_type,ref_type,ref_id,from_location,to_location,gross_weight,user_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(si['item_id'],'sale_cancel','sale',sale_id,'customer',f"branch:{sale['branch_id']}",si['gross_weight'],user['id'],reason,now))
     conn.execute("UPDATE sales SET status='cancelled',cancelled_at=?,cancelled_by=? WHERE id=?",(now,user['id'],sale_id))
     if sale['customer_id'] and sale['payment_credit']:
         row=conn.execute('SELECT balance_paise FROM customers WHERE id=?',(sale['customer_id'],)).fetchone();newp=int(row['balance_paise'] or 0)-money_paise(sale['payment_credit']);conn.execute('UPDATE customers SET balance=?,balance_paise=?,updated_at=? WHERE id=?',(paise_money(newp),newp,now,sale['customer_id']))
+    # Reverse loyalty: redeemed points return, earned points removed.
+    try:
+        if sale['customer_id'] and (sale['loyalty_redeemed'] or sale['loyalty_earned']):
+            crow=conn.execute('SELECT loyalty_points FROM customers WHERE id=?',(sale['customer_id'],)).fetchone()
+            cur_pts=int(float(crow['loyalty_points'] or 0)) if crow else 0
+            new_pts=max(0,cur_pts+int(sale['loyalty_redeemed'] or 0)-int(sale['loyalty_earned'] or 0))
+            conn.execute('UPDATE customers SET loyalty_points=?,updated_at=? WHERE id=?',(new_pts,now,sale['customer_id']))
+    except Exception:pass
+    # Old-gold rows stay linked for audit but flagged via audit log (immutable trigger forbids delete).
+    # Payments rows are immutable; reversal is via journal + credit-note flow, recorded here in audit.
     je=conn.execute("SELECT id FROM journal_entries WHERE ref_type='sale' AND ref_id=? ORDER BY id LIMIT 1",(sale_id,)).fetchone()
     if je:_journal(conn,user['id'],f"Cancel sale {sale['invoice_no']}: {reason}",'sale_cancel',sale_id,[(x['account_code'],x['credit'],x['debit'],x['party_type'],x['party_id']) for x in conn.execute('SELECT * FROM journal_lines WHERE entry_id=?',(je['id'],)).fetchall()])
     audit(conn,user['id'],'cancel','sale',sale_id,{'reason':reason},client_ip);enqueue_tally(conn,'sale',sale_id,'cancel');

@@ -10,17 +10,17 @@ from .backup import BackupWorker,backup_status,create_backup,list_backups,restor
 from .company import get_company,save_company
 from .db import audit,business_date,business_now,day_is_closed,get_settings,init_db,next_sequence,read_db,request_fingerprint,rowdict,rowsdict,set_setting,utcnow,valid_branch_counter,write_db
 from .discovery import DiscoveryResponder
-from .pdfs import credit_note_pdf,invoice_pdf,label_pdf,stock_report_pdf
+from .pdfs import bulk_label_pdf, credit_note_pdf,invoice_pdf,label_pdf,stock_report_pdf
 from .security import VALID_ROLES,clear_login_failures,create_session,current_user,hash_password,login_lock_seconds,password_needs_rehash,record_login_failure,require,verify_password
 from .services import _journal,cancel_sale,create_item,latest_rate,money,post_sale,purity_fraction,quote_sale,require_client_request_id,transfer_item,update_item,weight
 from .returns import cancel_sale_return,list_returns,post_sale_return,quote_sale_return,return_detail
 from .integrity import database_integrity,day_close
-from .precision import mg_weight,money_paise,money_sum,paise_money
+from .precision import mg_weight,money_decimal,money_paise,money_sum,paise_money,weight_mg
 from .tally import TallySyncWorker,backfill_queue,bridge_health,enqueue_tally,get_mappings,process_pending,reconcile,set_mappings,validate_mappings
 from .tls import tls_identity
 
 PRODUCTION_HARDENED_V1 = True
-APP_VERSION='1.2.0-rc5'
+APP_VERSION='1.2.0-rc6'
 backup_worker=None;discovery=None;tally_worker=None
 @asynccontextmanager
 async def lifespan(app):
@@ -166,9 +166,21 @@ def rates(u=Depends(current_user)):
     with read_db() as c:return rowsdict(c.execute('SELECT * FROM metal_rates ORDER BY effective_at DESC,id DESC LIMIT 100').fetchall())
 @app.post('/api/rates')
 def add_rate(p:dict=Body(...),u=Depends(require('rates'))):
+    metal=str(p.get('metal') or '').strip()
+    purity=str(p.get('purity') or '').strip()
+    if not metal or not purity:
+        raise HTTPException(400,'Metal and purity are required')
+    if len(metal)>20 or len(purity)>10:
+        raise HTTPException(400,'Metal/purity value is too long')
     rate=money(p.get('rate_per_gram'))
     if rate<=0:raise HTTPException(400,'Rate must be positive')
-    with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by,rate_paise_per_gram) VALUES(?,?,?,?,?,?)',(p.get('metal') or 'Gold',p.get('purity') or '916',rate,p.get('effective_at') or utcnow(),u['id'],money_paise(rate)));audit(c,u['id'],'create','metal_rate',cur.lastrowid,p);return {'id':cur.lastrowid}
+    eff=str(p.get('effective_at') or utcnow()).strip()
+    try:
+        # Accept both date and datetime ISO strings.
+        dt.datetime.fromisoformat(eff.replace('Z','+00:00'))
+    except ValueError:
+        raise HTTPException(400,'Effective date must be ISO format (YYYY-MM-DD or datetime)')
+    with write_db() as c:cur=c.execute('INSERT INTO metal_rates(metal,purity,rate_per_gram,effective_at,created_by,rate_paise_per_gram) VALUES(?,?,?,?,?,?)',(metal,purity,rate,eff,u['id'],money_paise(rate)));audit(c,u['id'],'create','metal_rate',cur.lastrowid,{'metal':metal,'purity':purity,'rate':rate,'effective_at':eff});return {'id':cur.lastrowid}
 
 @app.get('/api/items')
 def items(q:str='',status:str='',branch_id:int|None=None,category:str='',limit:int=Query(500,le=2000),u=Depends(require('inventory.read'))):
@@ -237,6 +249,74 @@ def tag_pdf(iid:int,u=Depends(require('inventory.read'))):
         if not r:raise HTTPException(404,'Item not found')
         data=label_pdf(dict(r),get_settings(c));name=r['tag_no']
     return Response(data,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="tag-{name}.pdf"'})
+@app.get('/api/items/{iid}/label.zpl')
+def tag_zpl(iid:int,u=Depends(require('inventory.read'))):
+    from .label_printer import zpl_label as _z
+    with read_db() as c:
+        r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+        if not r:raise HTTPException(404,'Item not found')
+        try:data=_z(dict(r),get_settings(c))
+        except ValueError as e:raise HTTPException(400,str(e))
+        name=r['tag_no']
+    return Response(data,media_type='text/plain',headers={'Content-Disposition':f'attachment; filename="tag-{name}.zpl"'})
+@app.get('/api/items/{iid}/label.tspl')
+def tag_tspl(iid:int,u=Depends(require('inventory.read'))):
+    from .label_printer import tspl_label as _t
+    with read_db() as c:
+        r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+        if not r:raise HTTPException(404,'Item not found')
+        try:data=_t(dict(r),get_settings(c))
+        except ValueError as e:raise HTTPException(400,str(e))
+        name=r['tag_no']
+    return Response(data,media_type='text/plain',headers={'Content-Disposition':f'attachment; filename="tag-{name}.tspl"'})
+@app.post('/api/items/labels.pdf')
+def bulk_tag_pdf(p:dict=Body(...),u=Depends(require('inventory.read'))):
+    """Bulk re-print: one page per tag, max 100. Offline."""
+    ids=p.get('item_ids') or p.get('ids') or []
+    try:ids=[int(x) for x in ids][:100]
+    except Exception:raise HTTPException(400,'item_ids must be numeric (max 100)')
+    if not ids:raise HTTPException(400,'Select at least one tag')
+    with read_db() as c:
+        rows=[]
+        for iid in ids:
+            r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+            if not r:raise HTTPException(404,f'Item {iid} not found')
+            rows.append(dict(r))
+        from .pdfs import bulk_label_pdf as _bulk
+        data=_bulk(rows,get_settings(c))
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':'inline; filename="tags-bulk.pdf"'})
+@app.post('/api/items/labels.zpl')
+def bulk_tag_zpl(p:dict=Body(...),u=Depends(require('inventory.read'))):
+    ids=p.get('item_ids') or p.get('ids') or []
+    try:ids=[int(x) for x in ids][:100]
+    except Exception:raise HTTPException(400,'item_ids must be numeric (max 100)')
+    if not ids:raise HTTPException(400,'Select at least one tag')
+    from .label_printer import bulk_zpl as _bz
+    with read_db() as c:
+        rows=[]
+        for iid in ids:
+            r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+            if not r:raise HTTPException(404,f'Item {iid} not found')
+            rows.append(dict(r))
+        try:data=_bz(rows,get_settings(c))
+        except ValueError as e:raise HTTPException(400,str(e))
+    return Response(data,media_type='text/plain',headers={'Content-Disposition':'attachment; filename="tags-bulk.zpl"'})
+@app.post('/api/items/labels.tspl')
+def bulk_tag_tspl(p:dict=Body(...),u=Depends(require('inventory.read'))):
+    ids=p.get('item_ids') or p.get('ids') or []
+    try:ids=[int(x) for x in ids][:100]
+    except Exception:raise HTTPException(400,'item_ids must be numeric (max 100)')
+    if not ids:raise HTTPException(400,'Select at least one tag')
+    from .label_printer import bulk_tspl as _bt
+    with read_db() as c:
+        rows=[]
+        for iid in ids:
+            r=c.execute('SELECT * FROM items WHERE id=?',(iid,)).fetchone()
+            if not r:raise HTTPException(404,f'Item {iid} not found')
+            rows.append(dict(r))
+        try:data=_bt(rows,get_settings(c))
+        except ValueError as e:raise HTTPException(400,str(e))
+    return Response(data,media_type='text/plain',headers={'Content-Disposition':'attachment; filename="tags-bulk.tspl"'})
 
 def party_list(table,q=''):
     with read_db() as c:
@@ -245,18 +325,50 @@ def party_list(table,q=''):
 def party_add(c,table,seq,prefix,p,u):
     code=str(p.get('code') or '').strip() or next_sequence(c,seq,prefix,5);now=utcnow()
     if table=='karigars':cur=c.execute('INSERT INTO karigars(code,name,phone,address,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('address'),p.get('notes'),now,now))
-    else:cur=c.execute(f'INSERT INTO {table}(code,name,phone,email,address,gstin,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('email'),p.get('address'),p.get('gstin'),p.get('notes'),now,now))
+    else:
+        extra=""
+        if table=='customers':
+            # offline CRM fields
+            cur=c.execute(f'INSERT INTO {table}(code,name,phone,email,address,gstin,birthday,anniversary,loyalty_points,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('email'),p.get('address'),p.get('gstin'),p.get('birthday'),p.get('anniversary'),0,p.get('notes'),now,now))
+        else:cur=c.execute(f'INSERT INTO {table}(code,name,phone,email,address,gstin,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(code,p.get('name'),p.get('phone'),p.get('email'),p.get('address'),p.get('gstin'),p.get('notes'),now,now))
     audit(c,u['id'],'create',table[:-1],cur.lastrowid,{'code':code});return dict(c.execute(f'SELECT * FROM {table} WHERE id=?',(cur.lastrowid,)).fetchone())
+
+def party_update(c,table,pid,p,u):
+    row=c.execute(f'SELECT * FROM {table} WHERE id=?',(pid,)).fetchone()
+    if not row:raise HTTPException(404,'Party not found')
+    now=utcnow()
+    if table=='karigars':
+        c.execute('UPDATE karigars SET name=?,phone=?,address=?,notes=?,updated_at=? WHERE id=?',(p.get('name',row['name']),p.get('phone',row['phone']),p.get('address',row['address']),p.get('notes',row['notes']),now,pid))
+    else:
+        # validate birthday/anniversary offline (YYYY-MM-DD or blank)
+        for dk in ('birthday','anniversary'):
+            if dk in p and p[dk]:
+                try:dt.date.fromisoformat(str(p[dk]).strip())
+                except ValueError:raise HTTPException(400,f'{dk} must be YYYY-MM-DD or blank')
+        if table=='customers':
+            c.execute('UPDATE customers SET name=?,phone=?,email=?,address=?,gstin=?,birthday=?,anniversary=?,notes=?,updated_at=? WHERE id=?',(p.get('name',row['name']),p.get('phone',row['phone']),p.get('email',row['email']),p.get('address',row['address']),p.get('gstin',row['gstin']),p.get('birthday',row['birthday']),p.get('anniversary',row['anniversary']),p.get('notes',row['notes']),now,pid))
+        else:
+            c.execute(f'UPDATE {table} SET name=?,phone=?,email=?,address=?,gstin=?,notes=?,updated_at=? WHERE id=?',(p.get('name',row['name']),p.get('phone',row['phone']),p.get('email',row['email']),p.get('address',row['address']),p.get('gstin',row['gstin']),p.get('notes',row['notes']),now,pid))
+    audit(c,u['id'],'update',table[:-1],pid,{k:v for k,v in p.items() if k!='password'})
+    return dict(c.execute(f'SELECT * FROM {table} WHERE id=?',(pid,)).fetchone())
 @app.get('/api/customers')
 def customers(q:str='',u=Depends(require('contacts'))):return party_list('customers',q)
 @app.post('/api/customers')
 def customer_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    if not str(p.get('name') or '').strip():raise HTTPException(400,'Customer name is required')
     with write_db() as c:return party_add(c,'customers','customer','C',p,u)
+@app.put('/api/customers/{pid}')
+def customer_edit(pid:int,p:dict=Body(...),u=Depends(require('contacts'))):
+    with write_db() as c:return party_update(c,'customers',pid,p,u)
 @app.get('/api/suppliers')
 def suppliers(q:str='',u=Depends(require('contacts'))):return party_list('suppliers',q)
 @app.post('/api/suppliers')
 def supplier_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    if not str(p.get('name') or '').strip():raise HTTPException(400,'Supplier name is required')
     with write_db() as c:return party_add(c,'suppliers','supplier','S',p,u)
+@app.put('/api/suppliers/{pid}')
+def supplier_edit(pid:int,p:dict=Body(...),u=Depends(require('contacts'))):
+    with write_db() as c:return party_update(c,'suppliers',pid,p,u)
 @app.get('/api/karigars')
 def karigars(q:str='',u=Depends(require('contacts'))):return party_list('karigars',q)
 @app.post('/api/karigars')
@@ -269,7 +381,10 @@ def sales_quote(p:dict=Body(...),u=Depends(require('sales'))):
     with read_db() as c:
         if context['branch_id'] not in (None,'') and not valid_branch_counter(c,int(context['branch_id']),int(context['counter_id']) if context['counter_id'] not in (None,'') else None):
             raise HTTPException(400,detail={'code':'INVALID_LOCATION','message':'The selected branch and counter are not a valid active pairing'})
-        return quote_sale(c,p.get('lines') or [],p.get('discount',0),money_sum(x.get('value',0) for x in p.get('old_gold') or []),context)
+        try:loyal_pts=int(p.get('loyalty_redeem_points') or 0)
+        except Exception:loyal_pts=0
+        eff_disc=money(money_decimal(p.get('discount',0))+money_decimal(loyal_pts))
+        return quote_sale(c,p.get('lines') or [],eff_disc,money_sum(x.get('value',0) for x in p.get('old_gold') or []),context)
 @app.post('/api/sales')
 def sale(req:Request,p:dict=Body(...),u=Depends(require('sales'))):
     with write_db() as c:return post_sale(c,p,u,ip(req))
@@ -283,8 +398,8 @@ def reconcile_operation(operation: str, request_id: str, u=Depends(current_user)
     queries = {
         "sale": ("SELECT id,invoice_no AS reference,status,total FROM sales WHERE client_request_id=?", "sales"),
         "purchase": ("SELECT id,purchase_no AS reference,status,total FROM purchases WHERE client_request_id=?", "purchases"),
-        "sale_return": ("SELECT id,return_no AS reference,status,total FROM sale_returns WHERE client_request_id=?", "sale_returns"),
-        "return": ("SELECT id,return_no AS reference,status,total FROM sale_returns WHERE client_request_id=?", "sale_returns"),
+        "sale_return": ("SELECT id,return_no AS reference,status,total_paise/100.0 AS total FROM sale_returns WHERE client_request_id=?", "sale_returns"),
+        "return": ("SELECT id,return_no AS reference,status,total_paise/100.0 AS total FROM sale_returns WHERE client_request_id=?", "sale_returns"),
     }
     if operation not in queries:
         raise HTTPException(400, detail={"code": "UNSUPPORTED_OPERATION", "message": "This operation cannot be reconciled"})
@@ -382,6 +497,126 @@ def purchase(p:dict=Body(...),u=Depends(require('purchases'))):
 def purchases(u=Depends(require('purchases'))):
     with read_db() as c:return rowsdict(c.execute('SELECT p.*,s.name supplier_name FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.id DESC LIMIT 500').fetchall())
 
+@app.get('/api/estimations')
+def estimations_list(limit:int=Query(200,le=1000),u=Depends(require('sales'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT e.*,cu.name customer_name FROM estimations e LEFT JOIN customers cu ON cu.id=e.customer_id ORDER BY e.id DESC LIMIT ?',(limit,)).fetchall())
+@app.get('/api/estimations/{eid}')
+def estimation_detail(eid:int,u=Depends(require('sales'))):
+    with read_db() as c:
+        e=c.execute('SELECT * FROM estimations WHERE id=?',(eid,)).fetchone()
+        if not e:raise HTTPException(404,'Estimation not found')
+        items=rowsdict(c.execute('SELECT * FROM estimation_items WHERE estimation_id=? ORDER BY id',(eid,)).fetchall())
+        return {'estimation':dict(e),'items':items}
+@app.post('/api/estimations')
+def estimation_create(p:dict=Body(...),u=Depends(require('sales'))):
+    """Offline estimation: server-priced quote saved without touching stock."""
+    from .services import quote_sale as _quote
+    lines=p.get('lines') or []
+    if not lines:raise HTTPException(400,'Estimation must contain at least one tag')
+    bid=int(p.get('branch_id') or 1);counter=p.get('counter_id') or None;counter=int(counter) if counter is not None else None
+    ctx={'branch_id':bid,'counter_id':counter}
+    with write_db() as c:
+        if not valid_branch_counter(c,bid,counter):raise HTTPException(400,'Invalid branch/counter')
+        q=_quote(c,lines,p.get('discount',0),0,ctx)
+        no=next_sequence(c,'estimation','EST-',6);now=utcnow();cid=p.get('customer_id') or None
+        cur=c.execute('INSERT INTO estimations(est_no,customer_id,branch_id,counter_id,subtotal_paise,discount_paise,taxable_paise,gst_paise,total_paise,status,notes,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,?)',(no,cid,bid,counter,money_paise(q['subtotal']),money_paise(q['discount']),money_paise(q['taxable']),money_paise(q['gst']),money_paise(q['total']),'open',p.get('notes'),u['id'],now))
+        eid=cur.lastrowid
+        for l in q['lines']:
+            c.execute('INSERT INTO estimation_items(estimation_id,item_id,tag_no,description,metal,purity,gross_weight,net_weight,metal_rate,metal_value,wastage_value,making_charge,stone_value,discount,taxable,gst_rate,gst_amount,line_total) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(eid,l['item_id'],l['tag_no'],l['description'],l['metal'],l['purity'],l['gross_weight'],l['net_weight'],l['metal_rate'],l['metal_value'],l['wastage_value'],l['making_charge'],l['stone_value'],l['discount'],l['taxable'],l['gst_rate'],l['gst_amount'],l['line_total']))
+        audit(c,u['id'],'create','estimation',eid,{'est_no':no,'total':q['total']})
+        return {'id':eid,'est_no':no,'total':q['total'],'quote':q}
+@app.get('/api/estimations/{eid}/estimation.pdf')
+def estimation_pdf_route(eid:int,u=Depends(require('sales'))):
+    from .pdfs import estimation_pdf as _epdf
+    with read_db() as c:
+        e=c.execute('SELECT * FROM estimations WHERE id=?',(eid,)).fetchone()
+        if not e:raise HTTPException(404,'Estimation not found')
+        items=rowsdict(c.execute('SELECT * FROM estimation_items WHERE estimation_id=?',(eid,)).fetchall())
+        cust=None
+        if e['customer_id']:cust=rowdict(c.execute('SELECT * FROM customers WHERE id=?',(e['customer_id'],)).fetchone())
+        data=_epdf(dict(e),items,cust,get_settings(c))
+    return Response(data,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="EST-{eid}.pdf"'})
+@app.post('/api/estimations/{eid}/cancel')
+def estimation_cancel(eid:int,u=Depends(require('sales'))):
+    with write_db() as c:
+        e=c.execute('SELECT * FROM estimations WHERE id=?',(eid,)).fetchone()
+        if not e:raise HTTPException(404,'Estimation not found')
+        c.execute("UPDATE estimations SET status='cancelled' WHERE id=?",(eid,));audit(c,u['id'],'cancel','estimation',eid,{})
+        return {'ok':True}
+
+# ---- Offline chit schemes + gold loans (local ledgers, no internet) ----
+@app.get('/api/chit-schemes')
+def chit_schemes(u=Depends(require('contacts'))):
+    with read_db() as c:return rowsdict(c.execute('SELECT * FROM chit_schemes ORDER BY id DESC').fetchall())
+@app.post('/api/chit-schemes')
+def chit_scheme_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    name=str(p.get('name') or '').strip()
+    if not name:raise HTTPException(400,'Scheme name is required')
+    try:tenure=int(p.get('tenure_months') or 11);amt=money(p.get('monthly_amount',0))
+    except Exception:raise HTTPException(400,'Tenure and amount must be numeric')
+    if tenure<=0 or amt<=0:raise HTTPException(400,'Tenure and monthly amount must be positive')
+    with write_db() as c:
+        code=str(p.get('code') or '').strip() or next_sequence(c,'chit','CHIT-',4)
+        cur=c.execute('INSERT INTO chit_schemes(code,name,metal,tenure_months,monthly_amount_paise,target_weight_mg,making_discount_percent,active,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(code,name,str(p.get('metal') or 'Gold'),tenure,money_paise(amt),weight_mg(p.get('target_weight',0)),float(p.get('making_discount_percent') or 0),1,utcnow()))
+        audit(c,u['id'],'create','chit_scheme',cur.lastrowid,{'name':name});return {'id':cur.lastrowid,'code':code}
+@app.get('/api/chit-members')
+def chit_members(scheme_id:int|None=None,u=Depends(require('contacts'))):
+    with read_db() as c:
+        if scheme_id:return rowsdict(c.execute('SELECT m.*,cu.name customer_name,s.name scheme_name FROM chit_members m JOIN customers cu ON cu.id=m.customer_id JOIN chit_schemes s ON s.id=m.scheme_id WHERE m.scheme_id=? ORDER BY m.id DESC',(scheme_id,)).fetchall())
+        return rowsdict(c.execute('SELECT m.*,cu.name customer_name,s.name scheme_name FROM chit_members m JOIN customers cu ON cu.id=m.customer_id JOIN chit_schemes s ON s.id=m.scheme_id ORDER BY m.id DESC LIMIT 500').fetchall())
+@app.post('/api/chit-members')
+def chit_member_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    try:sid=int(p.get('scheme_id'));cid=int(p.get('customer_id'))
+    except Exception:raise HTTPException(400,'Scheme and customer are required')
+    with write_db() as c:
+        if not c.execute('SELECT id FROM chit_schemes WHERE id=?',(sid,)).fetchone():raise HTTPException(400,'Scheme not found')
+        if not c.execute('SELECT id FROM customers WHERE id=?',(cid,)).fetchone():raise HTTPException(400,'Customer not found')
+        try:cur=c.execute('INSERT INTO chit_members(scheme_id,customer_id,start_date,status,total_paid_paise,created_at) VALUES(?,?,?,\"active\",0,?)',(sid,cid,str(p.get('start_date') or business_date(c)),utcnow()))
+        except Exception:raise HTTPException(409,'Customer already enrolled for that start date')
+        audit(c,u['id'],'create','chit_member',cur.lastrowid,{});return {'id':cur.lastrowid}
+@app.post('/api/chit-members/{mid}/pay')
+def chit_pay(mid:int,p:dict=Body(...),u=Depends(require('contacts'))):
+    try:amt=money(p.get('amount',0))
+    except Exception:raise HTTPException(400,'Amount must be numeric')
+    if amt<=0:raise HTTPException(400,'Amount must be positive')
+    with write_db() as c:
+        m=c.execute('SELECT * FROM chit_members WHERE id=?',(mid,)).fetchone()
+        if not m:raise HTTPException(404,'Member not found')
+        if m['status']!='active':raise HTTPException(409,'Only active members can pay')
+        c.execute('INSERT INTO chit_payments(member_id,amount_paise,method,paid_on,user_id,created_at) VALUES(?,?,?,?,?,?)',(mid,money_paise(amt),str(p.get('method') or 'cash'),str(p.get('paid_on') or business_date(c)),u['id'],utcnow()))
+        c.execute('UPDATE chit_members SET total_paid_paise=total_paid_paise+? WHERE id=?',(money_paise(amt),mid))
+        audit(c,u['id'],'create','chit_payment',mid,{'amount':amt});return {'ok':True}
+@app.get('/api/gold-loans')
+def gold_loans(status:str='',u=Depends(require('contacts'))):
+    with read_db() as c:
+        if status:return rowsdict(c.execute('SELECT g.*,cu.name customer_name FROM gold_loans g JOIN customers cu ON cu.id=g.customer_id WHERE g.status=? ORDER BY g.id DESC LIMIT 500',(status,)).fetchall())
+        return rowsdict(c.execute('SELECT g.*,cu.name customer_name FROM gold_loans g JOIN customers cu ON cu.id=g.customer_id ORDER BY g.id DESC LIMIT 500').fetchall())
+@app.post('/api/gold-loans')
+def gold_loan_add(p:dict=Body(...),u=Depends(require('contacts'))):
+    try:cid=int(p.get('customer_id'));gw=weight(p.get('gross_weight',0));nw=weight(p.get('net_weight',0));amt=money(p.get('loan_amount',0));rate=float(p.get('interest_monthly_percent') or 2.0)
+    except Exception:raise HTTPException(400,'Loan fields must be numeric')
+    if gw<=0 or nw<=0 or amt<=0:raise HTTPException(400,'Weights and loan amount must be positive')
+    if not 0<=rate<=10:raise HTTPException(400,'Monthly interest must be 0-10%')
+    with write_db() as c:
+        if not c.execute('SELECT id FROM customers WHERE id=?',(cid,)).fetchone():raise HTTPException(400,'Customer not found')
+        no=next_sequence(c,'goldloan','GL-',6)
+        cur=c.execute('INSERT INTO gold_loans(loan_no,customer_id,gross_weight,net_weight,purity,loan_amount_paise,interest_monthly_percent,status,issued_on,due_on,notes,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,cid,gw,nw,str(p.get('purity') or '916'),money_paise(amt),rate,'open',str(p.get('issued_on') or business_date(c)),p.get('due_on'),p.get('notes'),u['id'],utcnow()))
+        audit(c,u['id'],'create','gold_loan',cur.lastrowid,{'loan_no':no});return {'id':cur.lastrowid,'loan_no':no}
+@app.post('/api/gold-loans/{lid}/pay')
+def gold_loan_pay(lid:int,p:dict=Body(...),u=Depends(require('contacts'))):
+    try:amt=money(p.get('amount',0))
+    except Exception:raise HTTPException(400,'Amount must be numeric')
+    if amt<=0:raise HTTPException(400,'Amount must be positive')
+    kind=str(p.get('kind') or 'interest')
+    if kind not in ('interest','principal','closure'):raise HTTPException(400,'Invalid payment kind')
+    with write_db() as c:
+        g=c.execute('SELECT * FROM gold_loans WHERE id=?',(lid,)).fetchone()
+        if not g:raise HTTPException(404,'Loan not found')
+        if g['status']!='open':raise HTTPException(409,'Only open loans accept payments')
+        c.execute('INSERT INTO gold_loan_payments(loan_id,amount_paise,kind,paid_on,user_id,created_at) VALUES(?,?,?,?,?,?)',(lid,money_paise(amt),kind,str(p.get('paid_on') or business_date(c)),u['id'],utcnow()))
+        if kind=='closure':c.execute("UPDATE gold_loans SET status='closed',closed_on=? WHERE id=?",(str(p.get('paid_on') or business_date(c)),lid))
+        audit(c,u['id'],'create','gold_loan_payment',lid,{'amount':amt,'kind':kind});return {'ok':True}
+
 def wf_list(table):
     with read_db() as c:
         sql='SELECT r.*,c.name customer_name,k.name karigar_name FROM repairs r LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN karigars k ON k.id=r.karigar_id ORDER BY r.id DESC LIMIT 500' if table=='repairs' else 'SELECT o.*,c.name customer_name,k.name karigar_name FROM orders o LEFT JOIN customers c ON c.id=o.customer_id LEFT JOIN karigars k ON k.id=o.karigar_id ORDER BY o.id DESC LIMIT 500';return rowsdict(c.execute(sql).fetchall())
@@ -389,29 +624,75 @@ def wf_list(table):
 def repairs(u=Depends(require('repairs'))):return wf_list('repairs')
 @app.post('/api/repairs')
 def repair_add(p:dict=Body(...),u=Depends(require('repairs'))):
-    with write_db() as c:no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('item_description') or 'Jewellery repair',p.get('tag_no'),weight(p.get('gross_weight',0)),p.get('received_on') or business_date(c),p.get('promised_on'),p.get('status') or 'received',p.get('karigar_id'),money(p.get('estimated_amount')),money(p.get('advance')),0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
+    desc=str(p.get('item_description') or '').strip()
+    if not desc:raise HTTPException(400,'Repair description is required')
+    cid=p.get('customer_id');kid=p.get('karigar_id')
+    try:
+        gw=weight(p.get('gross_weight',0));est=money(p.get('estimated_amount',0));adv=money(p.get('advance',0))
+    except Exception:raise HTTPException(400,'Repair weights and amounts must be numeric')
+    if gw<0 or est<0 or adv<0:raise HTTPException(400,'Repair weights and amounts cannot be negative')
+    status=str(p.get('status') or 'received')
+    if status not in ('received','assigned','in_progress','ready','delivered','cancelled'):raise HTTPException(400,'Invalid repair status')
+    promised=p.get('promised_on')
+    if promised:
+        try:dt.date.fromisoformat(str(promised))
+        except ValueError:raise HTTPException(400,'Promised date must be YYYY-MM-DD')
+    with write_db() as c:
+        if cid and not c.execute('SELECT id FROM customers WHERE id=? AND active=1',(cid,)).fetchone():raise HTTPException(400,'Selected customer does not exist')
+        if kid and not c.execute('SELECT id FROM karigars WHERE id=? AND active=1',(kid,)).fetchone():raise HTTPException(400,'Selected karigar does not exist')
+        no=next_sequence(c,'repair','REP-',6);now=utcnow();cur=c.execute('INSERT INTO repairs(repair_no,customer_id,item_description,tag_no,gross_weight,received_on,promised_on,status,karigar_id,estimated_amount,advance,final_amount,notes,created_by,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,cid,desc,p.get('tag_no'),gw,p.get('received_on') or business_date(c),promised,status,kid,est,adv,0,p.get('notes'),u['id'],now));return {'id':cur.lastrowid,'repair_no':no}
 @app.put('/api/repairs/{rid}')
 def repair_edit(rid:int,p:dict=Body(...),u=Depends(require('repairs'))):
     with write_db() as c:r=c.execute('SELECT * FROM repairs WHERE id=?',(rid,)).fetchone();
     if not r:raise HTTPException(404,'Repair not found')
-    with write_db() as c:c.execute('UPDATE repairs SET status=?,karigar_id=?,promised_on=?,estimated_amount=?,advance=?,final_amount=?,notes=?,updated_at=? WHERE id=?',(p.get('status',r['status']),p.get('karigar_id',r['karigar_id']),p.get('promised_on',r['promised_on']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),money(p.get('final_amount',r['final_amount'])),p.get('notes',r['notes']),utcnow(),rid));return {'ok':True}
+    status=str(p.get('status',r['status']))
+    if status not in ('received','assigned','in_progress','ready','delivered','cancelled'):raise HTTPException(400,'Invalid repair status')
+    kid=p.get('karigar_id',r['karigar_id'])
+    if kid and not c.execute('SELECT id FROM karigars WHERE id=? AND active=1',(kid,)).fetchone():raise HTTPException(400,'Selected karigar does not exist')
+    with write_db() as c:c.execute('UPDATE repairs SET status=?,karigar_id=?,promised_on=?,estimated_amount=?,advance=?,final_amount=?,notes=?,updated_at=? WHERE id=?',(status,kid,p.get('promised_on',r['promised_on']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),money(p.get('final_amount',r['final_amount'])),p.get('notes',r['notes']),utcnow(),rid));return {'ok':True}
 @app.get('/api/orders')
 def orders(u=Depends(require('orders'))):return wf_list('orders')
 @app.post('/api/orders')
 def order_add(p:dict=Body(...),u=Depends(require('orders'))):
-    with write_db() as c:no=next_sequence(c,'order','ORD-',6);now=utcnow();cur=c.execute('INSERT INTO orders(order_no,customer_id,description,metal,purity,target_weight,karigar_id,status,estimated_amount,advance,due_date,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,p.get('customer_id'),p.get('description') or 'Custom jewellery',p.get('metal') or 'Gold',p.get('purity') or '916',weight(p.get('target_weight',0)),p.get('karigar_id'),p.get('status') or 'new',money(p.get('estimated_amount')),money(p.get('advance')),p.get('due_date'),p.get('notes'),u['id'],now,now));return {'id':cur.lastrowid,'order_no':no}
+    desc=str(p.get('description') or '').strip()
+    if not desc:raise HTTPException(400,'Order description is required')
+    cid=p.get('customer_id');kid=p.get('karigar_id')
+    try:
+        tw=weight(p.get('target_weight',0));est=money(p.get('estimated_amount',0));adv=money(p.get('advance',0))
+    except Exception:raise HTTPException(400,'Order weights and amounts must be numeric')
+    if tw<0 or est<0 or adv<0:raise HTTPException(400,'Order weights and amounts cannot be negative')
+    status=str(p.get('status') or 'new')
+    if status not in ('new','assigned','in_progress','ready','delivered','cancelled'):raise HTTPException(400,'Invalid order status')
+    due=p.get('due_date')
+    if due:
+        try:dt.date.fromisoformat(str(due))
+        except ValueError:raise HTTPException(400,'Due date must be YYYY-MM-DD')
+    with write_db() as c:
+        if cid and not c.execute('SELECT id FROM customers WHERE id=? AND active=1',(cid,)).fetchone():raise HTTPException(400,'Selected customer does not exist')
+        if kid and not c.execute('SELECT id FROM karigars WHERE id=? AND active=1',(kid,)).fetchone():raise HTTPException(400,'Selected karigar does not exist')
+        no=next_sequence(c,'order','ORD-',6);now=utcnow();cur=c.execute('INSERT INTO orders(order_no,customer_id,description,metal,purity,target_weight,karigar_id,status,estimated_amount,advance,due_date,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(no,cid,desc,p.get('metal') or 'Gold',p.get('purity') or '916',tw,kid,status,est,adv,due,p.get('notes'),u['id'],now,now));return {'id':cur.lastrowid,'order_no':no}
 @app.put('/api/orders/{oid}')
 def order_edit(oid:int,p:dict=Body(...),u=Depends(require('orders'))):
     with read_db() as c:r=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
     if not r:raise HTTPException(404,'Order not found')
-    with write_db() as c:c.execute('UPDATE orders SET status=?,karigar_id=?,due_date=?,estimated_amount=?,advance=?,notes=?,updated_at=? WHERE id=?',(p.get('status',r['status']),p.get('karigar_id',r['karigar_id']),p.get('due_date',r['due_date']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),p.get('notes',r['notes']),utcnow(),oid));return {'ok':True}
+    status=str(p.get('status',r['status']))
+    if status not in ('new','assigned','in_progress','ready','delivered','cancelled'):raise HTTPException(400,'Invalid order status')
+    with write_db() as c:
+        kid=p.get('karigar_id',r['karigar_id'])
+        if kid and not c.execute('SELECT id FROM karigars WHERE id=? AND active=1',(kid,)).fetchone():raise HTTPException(400,'Selected karigar does not exist')
+        c.execute('UPDATE orders SET status=?,karigar_id=?,due_date=?,estimated_amount=?,advance=?,notes=?,updated_at=? WHERE id=?',(status,kid,p.get('due_date',r['due_date']),money(p.get('estimated_amount',r['estimated_amount'])),money(p.get('advance',r['advance'])),p.get('notes',r['notes']),utcnow(),oid));return {'ok':True}
 
 @app.get('/api/karigars/{kid}/ledger')
 def kledger(kid:int,u=Depends(require('contacts'))):
     with read_db() as c:return rowsdict(c.execute('SELECT * FROM karigar_ledger WHERE karigar_id=? ORDER BY id DESC LIMIT 500',(kid,)).fetchall())
 @app.post('/api/karigars/{kid}/ledger')
 def kledger_add(kid:int,p:dict=Body(...),u=Depends(require('contacts'))):
-    typ=p.get('entry_type') or 'adjustment';wt=weight(p.get('weight'));amt=money(p.get('amount'))
+    typ=str(p.get('entry_type') or 'adjustment')
+    if typ not in ('metal_issue','metal_receive','cash_debit','cash_credit','making_charge','adjustment'):
+        raise HTTPException(400,'Invalid karigar ledger entry type')
+    try:wt=weight(p.get('weight',0));amt=money(p.get('amount',0))
+    except Exception:raise HTTPException(400,'Karigar weight and amount must be numeric')
+    if wt<0 or amt<0:raise HTTPException(400,'Karigar weight and amount cannot be negative')
     with write_db() as c:
         if not c.execute('SELECT id FROM karigars WHERE id=?',(kid,)).fetchone():raise HTTPException(404,'Karigar not found')
         cur=c.execute('INSERT INTO karigar_ledger(karigar_id,entry_type,metal,weight,amount,ref_type,ref_id,note,user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(kid,typ,p.get('metal'),wt,amt,p.get('ref_type'),p.get('ref_id'),p.get('note'),u['id'],utcnow()));md=wt if typ=='metal_issue' else -wt if typ=='metal_receive' else 0;cd=amt if typ in ('cash_debit','making_charge') else -amt if typ=='cash_credit' else 0;row=c.execute('SELECT metal_balance_mg,cash_balance_paise FROM karigars WHERE id=?',(kid,)).fetchone();newmg=int(row['metal_balance_mg'] or 0)+int(round(md*1000));newp=int(row['cash_balance_paise'] or 0)+money_paise(cd);c.execute('UPDATE karigars SET metal_balance_grams=?,metal_balance_mg=?,cash_balance=?,cash_balance_paise=?,updated_at=? WHERE id=?',(mg_weight(newmg),newmg,paise_money(newp),newp,utcnow(),kid));return {'id':cur.lastrowid}
@@ -577,6 +858,48 @@ def trial(date_to:str='',u=Depends(require('reports'))):
 @app.get('/api/reports/ledger/{code}')
 def ledger(code:str,date_from:str='',date_to:str='',u=Depends(require('reports'))):
     with read_db() as c:return rowsdict(c.execute('SELECT je.entry_no,je.entry_date,je.memo,je.ref_type,je.ref_id,jl.debit_paise/100.0 debit,jl.credit_paise/100.0 credit FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE jl.account_code=? AND je.entry_date BETWEEN ? AND ? ORDER BY je.entry_date,je.id',(code,date_from or '0001-01-01',date_to or '9999-12-31')).fetchall())
+@app.get('/api/reports/profit-loss')
+def profit_loss(date_from:str='',date_to:str='',u=Depends(require('reports'))):
+    """Offline P&L: sales - returns - COGS. All local, no internet."""
+    with read_db() as c:
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today
+        s=c.execute("SELECT coalesce(sum(taxable_paise),0) t,coalesce(sum(total_paise),0) tot FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone()
+        r=c.execute("SELECT coalesce(sum(taxable_paise),0) t,coalesce(sum(total_paise),0) tot FROM sale_returns WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone()
+        cogs=c.execute("SELECT coalesce(sum(si.cost_amount_paise),0) c FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE s.status='posted' AND s.business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone()[0]
+        cogs_ret=c.execute("SELECT coalesce(sum(ri.cost_amount_paise),0) c FROM sale_return_items ri JOIN sale_returns r ON r.id=ri.return_id WHERE r.status='posted' AND r.business_date BETWEEN ? AND ? AND ri.active=1",(date_from,date_to)).fetchone()[0]
+        gross_sales=paise_money(s['tot']);returns=paise_money(r['tot']);net_sales=round(gross_sales-returns,2)
+        cogs_net=paise_money(int(cogs or 0)-int(cogs_ret or 0));gross_profit=round(paise_money(s['t'])-paise_money(r['t'])-cogs_net,2)
+        return {'date_from':date_from,'date_to':date_to,'gross_sales':gross_sales,'returns':returns,'net_sales':net_sales,'cogs':cogs_net,'gross_profit':gross_profit}
+@app.get('/api/reports/balance-sheet')
+def balance_sheet(date_to:str='',u=Depends(require('reports'))):
+    """Offline balance sheet from trial balances. Assets = Liabilities + Equity."""
+    with read_db() as c:
+        date_to=date_to or business_date(c)
+        rows=rowsdict(c.execute("SELECT a.code,a.name,a.account_type,coalesce(sum(x.debit_paise),0)/100.0 debit,coalesce(sum(x.credit_paise),0)/100.0 credit FROM accounts a LEFT JOIN (SELECT jl.* FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id WHERE je.entry_date<=?) x ON x.account_code=a.code WHERE a.active=1 GROUP BY a.code",(date_to,)).fetchall())
+        def bal(r):return round(r['debit']-r['credit'],2)
+        assets=sum(bal(r) for r in rows if r['account_type']=='asset')
+        liabilities=sum(-bal(r) for r in rows if r['account_type']=='liability')
+        equity=sum(-bal(r) for r in rows if r['account_type']=='equity')
+        income=sum(-(r['debit']-r['credit']) for r in rows if r['account_type']=='income')
+        expense=sum((r['debit']-r['credit']) for r in rows if r['account_type']=='expense')
+        retained=round(income-expense,2)
+        return {'date_to':date_to,'assets':round(assets,2),'liabilities':round(liabilities,2),'equity':round(equity,2),'retained_earnings':retained,'balanced':abs(assets-(liabilities+equity+retained))<0.02,'lines':rows}
+@app.get('/api/reports/metal-wise')
+def metal_wise(date_from:str='',date_to:str='',u=Depends(require('reports'))):
+    with read_db() as c:
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today
+        sales=rowsdict(c.execute("SELECT si.metal,si.purity,count(*) pcs,coalesce(sum(si.taxable_paise),0)/100.0 taxable,coalesce(sum(si.gst_amount_paise),0)/100.0 gst,coalesce(sum(si.line_total_paise),0)/100.0 total FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE s.status='posted' AND s.business_date BETWEEN ? AND ? GROUP BY si.metal,si.purity ORDER BY si.metal,si.purity",(date_from,date_to)).fetchall())
+        purch=rowsdict(c.execute("SELECT i.metal,i.purity,count(*) pcs,coalesce(sum(pi.cost_amount_paise),0)/100.0 cost FROM purchase_items pi JOIN items i ON i.id=pi.item_id JOIN purchases p ON p.id=pi.purchase_id WHERE p.business_date BETWEEN ? AND ? GROUP BY i.metal,i.purity",(date_from,date_to)).fetchall())
+        stock=rowsdict(c.execute("SELECT metal,purity,count(*) pieces,sum(net_mg)/1000.0 net_weight,sum(cost_amount_paise)/100.0 cost FROM items WHERE status='in_stock' GROUP BY metal,purity").fetchall())
+        return {'date_from':date_from,'date_to':date_to,'sales':sales,'purchases':purch,'stock':stock}
+@app.get('/api/reports/gstr')
+def gstr(date_from:str='',date_to:str='',u=Depends(require('reports'))):
+    """Offline GSTR-ready summary: taxable + CGST/SGST/IGST per GST rate. Filing stays online, data is local."""
+    with read_db() as c:
+        today=business_date(c);date_from=date_from or today[:8]+'01';date_to=date_to or today
+        out=rowsdict(c.execute("SELECT si.gst_rate,coalesce(sum(si.taxable_paise),0)/100.0 taxable,coalesce(sum(si.gst_amount_paise),0)/100.0 gst,count(*) lines,coalesce(sum(si.line_total_paise),0)/100.0 total FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE s.status='posted' AND s.business_date BETWEEN ? AND ? GROUP BY si.gst_rate ORDER BY si.gst_rate",(date_from,date_to)).fetchall())
+        tot=c.execute("SELECT coalesce(sum(cgst_paise),0)/100.0 cgst,coalesce(sum(sgst_paise),0)/100.0 sgst,coalesce(sum(igst_paise),0)/100.0 igst FROM sales WHERE status='posted' AND business_date BETWEEN ? AND ?",(date_from,date_to)).fetchone()
+        return {'date_from':date_from,'date_to':date_to,'by_rate':out,'cgst':tot['cgst'],'sgst':tot['sgst'],'igst':tot['igst']}
 @app.get('/api/reports/stock.pdf')
 def stock_pdf(u=Depends(require('reports'))):
     with read_db() as c:data=stock_report_pdf(rowsdict(c.execute("SELECT * FROM items WHERE status='in_stock' ORDER BY category,tag_no").fetchall()),get_settings(c))

@@ -31,21 +31,86 @@ def _business_heading(settings: dict[str, str], styles) -> list[Any]:
     return story
 
 
+def _draw_single_label(c, item: dict[str, Any], settings: dict[str, str], width: float, height: float) -> None:
+    tag = str(item.get("tag_no") or "").strip()
+    if not tag:raise ValueError("Tag number is required")
+    barcode = str(item.get("barcode") or tag).strip()
+    if not barcode:raise ValueError("Barcode is required")
+    try:gw = float(item.get("gross_weight", 0)); nw = float(item.get("net_weight", 0))
+    except Exception:raise ValueError("Tag weights must be numeric")
+    c.setTitle(f"Tag {tag}")
+    c.setFont("Helvetica-Bold", 7); c.drawString(2 * mm, height - 4 * mm, settings.get("business_name", "Jewellery")[:32])
+    c.setFont("Helvetica", 6.5); c.drawString(2 * mm, height - 7.5 * mm, f"{tag}  {item.get('metal','')} {item.get('purity','')}")
+    c.drawString(2 * mm, height - 11 * mm, f"GW {gw:.3f}g  NW {nw:.3f}g")
+    huid = item.get("huid") or ""
+    if huid: c.drawString(2 * mm, height - 14.5 * mm, f"HUID {huid}")
+    # Code128 barcode — always printed (thermal + laser safe).
+    barcode = str(item.get("barcode") or tag).strip()
+    barcode = code128.Code128(barcode, barHeight=5 * mm, barWidth=0.28 * mm, humanReadable=False)
+    barcode.drawOn(c, 2 * mm, 2.2 * mm); c.setFont("Helvetica", 5.5); c.drawCentredString(width * 0.52, 1.0 * mm, str(item.get("barcode") or tag)[:26])
+    # QR only on taller stock (>=30mm) to avoid overlap on default 60x25.
+    # Content is offline: tag|barcode|net — no internet needed.
+    if height >= 30 * mm:
+        try:
+            from reportlab.graphics.barcode.qr import QrCodeWidget
+            from reportlab.graphics.shapes import Drawing
+            try:nw_q = float(item.get("net_weight", 0))
+            except Exception:nw_q = 0.0
+            qr = QrCodeWidget(f"{tag}|{str(item.get('barcode') or tag)}|{nw_q:.3f}g")
+            d = Drawing(9 * mm, 9 * mm); d.add(qr)
+            d.drawOn(c, width - 11 * mm, 1 * mm)
+        except Exception:
+            pass
+
+
 def label_pdf(item: dict[str, Any], settings: dict[str, str]) -> bytes:
-    width = float(settings.get("label_width_mm", 60)) * mm
-    height = float(settings.get("label_height_mm", 25)) * mm
+    try:w_mm = max(30, min(100, float(settings.get("label_width_mm", 60))))
+    except Exception:w_mm = 60
+    try:h_mm = max(15, min(60, float(settings.get("label_height_mm", 25))))
+    except Exception:h_mm = 25
+    width = w_mm * mm; height = h_mm * mm
     buf = io.BytesIO()
     from reportlab.pdfgen.canvas import Canvas
     c = Canvas(buf, pagesize=(width, height), pageCompression=1)
-    c.setTitle(f"Tag {item['tag_no']}")
-    c.setFont("Helvetica-Bold", 7); c.drawString(2 * mm, height - 4 * mm, settings.get("business_name", "Jewellery")[:32])
-    c.setFont("Helvetica", 6.5); c.drawString(2 * mm, height - 7.5 * mm, f"{item['tag_no']}  {item['metal']} {item['purity']}")
-    c.drawString(2 * mm, height - 11 * mm, f"GW {item['gross_weight']:.3f}g  NW {item['net_weight']:.3f}g")
-    huid = item.get("huid") or ""
-    if huid: c.drawString(2 * mm, height - 14.5 * mm, f"HUID {huid}")
-    barcode = code128.Code128(str(item["barcode"]), barHeight=6 * mm, barWidth=0.27 * mm, humanReadable=False)
-    barcode.drawOn(c, 2 * mm, 2.5 * mm); c.setFont("Helvetica", 5.5); c.drawCentredString(width * 0.66, 1.1 * mm, str(item["barcode"])[:30]); c.save()
+    _draw_single_label(c, item, settings, width, height)
+    c.showPage(); c.save()
     return buf.getvalue()
+
+
+def bulk_label_pdf(items: list[dict[str, Any]], settings: dict[str, str]) -> bytes:
+    """One PDF page per tag for bulk re-print. Offline, no internet."""
+    try:w_mm = max(30, min(100, float(settings.get("label_width_mm", 60))))
+    except Exception:w_mm = 60
+    try:h_mm = max(15, min(60, float(settings.get("label_height_mm", 25))))
+    except Exception:h_mm = 25
+    width = w_mm * mm; height = h_mm * mm
+    buf = io.BytesIO()
+    from reportlab.pdfgen.canvas import Canvas
+    c = Canvas(buf, pagesize=(width, height), pageCompression=1)
+    for it in items:
+        _draw_single_label(c, it, settings, width, height)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def estimation_pdf(est: dict[str, Any], lines: list[dict[str, Any]], customer: dict[str, Any] | None, settings: dict[str, str]) -> bytes:
+    """Offline estimation/quotation — clearly NOT a tax invoice, no stock movement."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=12*mm, rightMargin=12*mm, topMargin=10*mm, bottomMargin=10*mm, title=str(est.get('est_no','EST')))
+    styles = getSampleStyleSheet(); normal = ParagraphStyle("est-small", parent=styles["Normal"], fontSize=8, leading=10); right = ParagraphStyle("est-right", parent=normal, alignment=TA_RIGHT); center = ParagraphStyle("est-center", parent=normal, alignment=TA_CENTER)
+    story = _business_heading(settings, styles)
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("<b>ESTIMATION / QUOTATION — NOT A TAX INVOICE</b><br/>Valid only as price quote. Stock reserved only on tax invoice.", center))
+    story.append(Spacer(1, 3*mm))
+    cust = customer or {}
+    data = [["Tag", "Description", "NW", "Rate/g", "Taxable", "GST", "Total"]]
+    for l in lines:
+        data.append([l.get("tag_no",""), Paragraph(f"{l.get('description','')}<br/>{l.get('metal','')} {l.get('purity','')}", normal), f"{float(l.get('net_weight',0)):.3f}", _fmt(l.get("metal_rate")), _fmt(l.get("taxable")), _fmt(l.get("gst_amount")), _fmt(l.get("line_total"))])
+    t = Table(data, repeatRows=1, colWidths=[22*mm,55*mm,18*mm,24*mm,24*mm,20*mm,24*mm]); t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#eeeeee')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),7),('GRID',(0,0),(-1,-1),0.35,colors.grey),('ALIGN',(2,1),(-1,-1),'RIGHT')])); story.append(t)
+    est_no = est.get('est_no',''); total = float(est.get('total_paise',0))/100.0 if 'total_paise' in est else float(est.get('total',0))
+    story += [Spacer(1,4*mm), Paragraph(f"<b>Estimation {est_no} — Total Rs. {_fmt(total)}</b>", right), Spacer(1,2*mm), Paragraph(f"Customer: {cust.get('name','Walk-in')} {cust.get('phone','')}", normal)]
+    doc.build(story); return buf.getvalue()
 
 
 def invoice_pdf(sale: dict[str, Any], lines: list[dict[str, Any]], customer: dict[str, Any] | None, settings: dict[str, str], old_gold: list[dict[str, Any]] | None = None) -> bytes:

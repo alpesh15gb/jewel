@@ -17,17 +17,25 @@ def self_test() -> int:
         "jewel_client.config",
         "jewel_client.scale",
         "jewel_client.ui_theme",
+        "jewel_client.ui_common",
         "jewel_client.returns_page",
         "jewel_client.billing_page",
+        "jewel_client.label_send",
     )
     missing = [name for name in required if importlib.util.find_spec(name) is None]
     if missing:
         return 2
 
-    from jewel_client.api import Api, discover_servers  # noqa: F401
+    from jewel_client.api import Api, ApiError, discover_servers, format_fingerprint, probe_server_fingerprint, secure_url  # noqa: F401
     from jewel_client.billing_page import POSPage  # noqa: F401
-    from jewel_client.config import load_config, save_config  # noqa: F401
+    from jewel_client.config import load_config, load_pending_posts, remove_pending_post, save_config, save_pending_posts, upsert_pending_post  # noqa: F401
     from jewel_client.scale import read_scale  # noqa: F401
+    from jewel_client.ui_common import Page, center, form_dialog, money, open_pdf  # noqa: F401
+    from jewel_client.ui_theme import PALETTE, apply_theme, card, divider, status_pill  # noqa: F401
+    from jewel_client.returns_page import ReturnsPage  # noqa: F401
+    from jewel_client.label_send import save_file, send_serial, send_tcp  # noqa: F401
+    import jewel_client.main as _m  # noqa: F401
+    assert hasattr(_m, "App") and hasattr(_m, "LoginDialog") and hasattr(_m, "POSPage")
 
     return 0
 
@@ -56,11 +64,11 @@ def _crash_log(exc: BaseException) -> Path:
 
 
 def _install_enhanced_billing_page():
-    """Replace the legacy billing page before App builds navigation.
+    """Ensure App uses the unified billing screen.
 
-    Keeping this registration in the executable entry point lets the new billing
-    screen ship independently while the larger legacy desktop module is gradually
-    decomposed into smaller pages.
+    main.py now imports POSPage from billing_page directly; this hook is kept
+    for backwards compatibility (tests + older entry points) and simply
+    re-asserts the binding.
     """
     import jewel_client.main as main_module
     from jewel_client.billing_page import POSPage as BillingPOSPage
